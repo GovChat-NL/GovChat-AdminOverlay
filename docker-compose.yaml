@@ -1,24 +1,39 @@
-# Docker Compose voor Open WebUI met Help Overlay
+# Docker Compose voor Open WebUI met Help Overlay + Admin Panel
 #
 # Gebruik:
 #   docker compose up -d --build
 #
-# Open daarna: http://localhost:3000
+# Open daarna:
+#   Open WebUI:    http://localhost:3000
+#   Admin panel:   http://localhost:3002
 
 services:
   open-webui:
-    build: .
+    image: ghcr.io/open-webui/open-webui:main
     ports:
       - "3000:8080"
     volumes:
       - open-webui-data:/app/backend/data
+      - govchat-static:/app/backend/static
     environment:
-      # Pas de naam van je app aan — wordt gebruikt in {{APP_NAME}} placeholders
       - WEBUI_NAME=MijnOrganisatie AI
-      # Optioneel: stel andere env vars in
-      # - OPENAI_API_BASE_URL=https://api.openai.com/v1
-      # - OPENAI_API_KEY=sk-...
+      - STATIC_DIR=/app/backend/static
+    restart: unless-stopped
+
+  govchat-admin:
+    build: ./admin
+    container_name: govchat-admin
+    ports:
+      - "3002:3002"
+    environment:
+      - ADMIN_PASSWORD=${GOVCHAT_ADMIN_PASSWORD:-changeme}
+      - CORS_ORIGIN=${GOVCHAT_CORS_ORIGIN:-*}
+    volumes:
+      - govchat-admin-data:/data
+      - govchat-static:/publish
     restart: unless-stopped
 
 volumes:
   open-webui-data:
+  govchat-admin-data:
+  govchat-static:
