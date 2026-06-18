@@ -38,8 +38,8 @@ function ensureDataDir() {
 
 function initDefaults() {
   ensureDataDir();
-  const defaults = ["help-content.json", "apps.json", "loader.js", "custom.css"];
-  for (const file of defaults) {
+  const jsonDefaults = ["help-content.json", "apps.json"];
+  for (const file of jsonDefaults) {
     const target = path.join(DATA_DIR, file);
     if (!fs.existsSync(target)) {
       const source = path.join(__dirname, "defaults", file);
@@ -47,6 +47,27 @@ function initDefaults() {
         fs.copyFileSync(source, target);
         console.log(`[init] Copied default ${file} to ${DATA_DIR}`);
       }
+    }
+  }
+
+  // Keep apps.json synced with repository defaults to avoid stale webhook URL/token
+  // from older volumes when n8n integration is enabled.
+  const appsSource = path.join(__dirname, "defaults", "apps.json");
+  const appsTarget = path.join(DATA_DIR, "apps.json");
+  if (fs.existsSync(appsSource)) {
+    fs.copyFileSync(appsSource, appsTarget);
+    console.log(`[init] Synced runtime config apps.json to ${DATA_DIR}`);
+  }
+
+  // Keep runtime assets in sync with repository defaults on each start.
+  // This prevents stale loader/custom.css from old named volumes.
+  const runtimeAssets = ["loader.js", "custom.css"];
+  for (const file of runtimeAssets) {
+    const source = path.join(__dirname, "defaults", file);
+    const target = path.join(DATA_DIR, file);
+    if (fs.existsSync(source)) {
+      fs.copyFileSync(source, target);
+      console.log(`[init] Synced runtime asset ${file} to ${DATA_DIR}`);
     }
   }
 }
