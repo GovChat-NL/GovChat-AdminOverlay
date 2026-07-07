@@ -3,6 +3,7 @@ const cookieParser = require("cookie-parser");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const sharp = require("sharp");
 
 const app = express();
 const PORT = process.env.PORT || 3002;
@@ -11,12 +12,52 @@ const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 const DATA_DIR = process.env.DATA_DIR || "/data";
 const PUBLISH_DIR = process.env.PUBLISH_DIR || "/publish";
 const SESSION_SECRET = crypto.randomBytes(32).toString("hex");
+const IMAGE_JOBS_ENABLED = String(process.env.IMAGE_JOBS_ENABLED || "false").toLowerCase() === "true";
+const IMAGE_JOBS_TOKEN = String(process.env.IMAGE_JOBS_TOKEN || "").trim();
+const IMAGE_JOBS_WEBHOOK_URL = String(
+  process.env.IMAGE_JOBS_WEBHOOK_URL || "http://n8n:5678/webhook/image-generator",
+).trim();
+const IMAGE_JOBS_WEBHOOK_TOKEN = String(
+  process.env.IMAGE_JOBS_WEBHOOK_TOKEN || process.env.N8N_WEBHOOK_TOKEN || "",
+).trim();
+const IMAGE_JOBS_CONCURRENCY = Math.max(
+  1,
+  Number.parseInt(String(process.env.IMAGE_JOBS_CONCURRENCY || "1"), 10) || 1,
+);
+const IMAGE_JOBS_TTL_HOURS = Math.max(
+  1,
+  Number.parseInt(String(process.env.IMAGE_JOBS_TTL_HOURS || "24"), 10) || 24,
+);
+const CRAWLER_N8N_WEBHOOK_URL = String(
+  process.env.CRAWLER_N8N_WEBHOOK_URL || "http://n8n:5678/webhook/govcrawler-run",
+).trim();
+const CRAWLER_N8N_WEBHOOK_TOKEN = String(
+  process.env.CRAWLER_N8N_WEBHOOK_TOKEN || process.env.N8N_WEBHOOK_TOKEN || "",
+).trim();
+const CRAWLER_INTERNAL_TOKEN = String(
+  process.env.CRAWLER_INTERNAL_TOKEN || process.env.N8N_WEBHOOK_TOKEN || "",
+).trim();
+const CRAWLER_RUNS_LIMIT = Math.max(
+  10,
+  Number.parseInt(String(process.env.CRAWLER_RUNS_LIMIT || "200"), 10) || 200,
+);
+const ORCHESTRATOR_IMAGE_DATA_URL_MAX_CHARS_DEFAULT = Math.max(
+  50000,
+  Number.parseInt(String(process.env.N8N_ORCHESTRATOR_IMAGE_DATA_URL_MAX_CHARS || "450000"), 10) || 450000,
+);
+const ORCHESTRATOR_IMAGE_MAX_RESOLUTION_PX_DEFAULT = Math.max(
+  512,
+  Number.parseInt(String(process.env.N8N_ORCHESTRATOR_IMAGE_MAX_RESOLUTION_PX || "1568"), 10) || 1568,
+);
 
 // Active sessions (in-memory, resets on restart)
 const sessions = new Map();
+const imageJobs = new Map();
+const imageJobQueue = [];
+let imageWorkersActive = 0;
 
 // ── Middleware ──────────────────────────────────────────────────────
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
@@ -25,6 +66,14 @@ app.use("/api/config", (req, res, next) => {
   res.set("Access-Control-Allow-Origin", CORS_ORIGIN);
   res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.set("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+app.use("/api/image-jobs", (req, res, next) => {
+  res.set("Access-Control-Allow-Origin", CORS_ORIGIN);
+  res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-govchat-token");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
@@ -38,7 +87,7 @@ function ensureDataDir() {
 
 function initDefaults() {
   ensureDataDir();
-  const jsonDefaults = ["help-content.json", "apps.json"];
+  const jsonDefaults = ["help-content.json", "apps.json", "crawler-config.json", "orchestrator-config.json"];
   for (const file of jsonDefaults) {
     const target = path.join(DATA_DIR, file);
     if (!fs.existsSync(target)) {
@@ -69,6 +118,12 @@ function initDefaults() {
       fs.copyFileSync(source, target);
       console.log(`[init] Synced runtime asset ${file} to ${DATA_DIR}`);
     }
+  }
+
+  const crawlerRunsPath = path.join(DATA_DIR, "crawler-runs.json");
+  if (!fs.existsSync(crawlerRunsPath)) {
+    fs.writeFileSync(crawlerRunsPath, JSON.stringify({ runs: [] }, null, 2), "utf-8");
+    console.log(`[init] Created crawler-runs.json in ${DATA_DIR}`);
   }
 }
 
@@ -115,7 +170,7 @@ function publishFileRaw(filename) {
 }
 
 function publishAll() {
-  const jsonFiles = ["help-content.json", "apps.json"];
+  const jsonFiles = ["help-content.json", "apps.json", "orchestrator-config.json"];
   for (const file of jsonFiles) {
     const data = readJSON(file);
     if (data) publishFile(file, data);
@@ -124,6 +179,982 @@ function publishAll() {
   for (const file of rawFiles) {
     publishFileRaw(file);
   }
+}
+
+function readCrawlerConfig() {
+  const fallback = {
+    enabled: false,
+    timezone: "Europe/Amsterdam",
+    crawl_interval_minutes: 1440,
+    max_pages_per_run: 200,
+    max_depth: 3,
+    request_timeout_ms: 15000,
+    user_agent: "GovChatCrawler/1.0 (+https://govchat.nl)",
+    respect_robots_txt: true,
+    include_file_types: ["text/html", "application/pdf"],
+    embedding_enabled: true,
+    embedding_model: String(process.env.CRAWLER_EMBEDDING_MODEL || "govchat-embedding").trim() || "govchat-embedding",
+    embedding_max_chars: 8000,
+    skip_embedding_for_unchanged: true,
+    sources: [],
+  };
+  const stored = readJSON("crawler-config.json");
+  if (!stored || typeof stored !== "object") return fallback;
+  return {
+    ...fallback,
+    ...stored,
+    sources: Array.isArray(stored.sources) ? stored.sources : [],
+  };
+}
+
+function readOrchestratorConfig() {
+  const fallback = {
+    image_data_url_max_chars: ORCHESTRATOR_IMAGE_DATA_URL_MAX_CHARS_DEFAULT,
+    image_max_resolution_px: ORCHESTRATOR_IMAGE_MAX_RESOLUTION_PX_DEFAULT,
+  };
+  const stored = readJSON("orchestrator-config.json");
+  if (!stored || typeof stored !== "object") return fallback;
+  const maxChars = Math.max(
+    50000,
+    Number.parseInt(String(stored.image_data_url_max_chars || fallback.image_data_url_max_chars), 10) ||
+      fallback.image_data_url_max_chars,
+  );
+  const maxResolutionPx = Math.max(
+    512,
+    Number.parseInt(String(stored.image_max_resolution_px || fallback.image_max_resolution_px), 10) ||
+      fallback.image_max_resolution_px,
+  );
+  return {
+    image_data_url_max_chars: maxChars,
+    image_max_resolution_px: maxResolutionPx,
+  };
+}
+
+function validateOrchestratorConfig(input) {
+  if (!input || typeof input !== "object") {
+    throw new Error("Orchestrator-configuratie ontbreekt of is ongeldig");
+  }
+
+  const imageDataUrlMaxChars = Math.max(
+    50000,
+    Number.parseInt(String(input.image_data_url_max_chars || ORCHESTRATOR_IMAGE_DATA_URL_MAX_CHARS_DEFAULT), 10) ||
+      ORCHESTRATOR_IMAGE_DATA_URL_MAX_CHARS_DEFAULT,
+  );
+
+  const imageMaxResolutionPx = Math.max(
+    512,
+    Number.parseInt(
+      String(input.image_max_resolution_px || ORCHESTRATOR_IMAGE_MAX_RESOLUTION_PX_DEFAULT),
+      10,
+    ) || ORCHESTRATOR_IMAGE_MAX_RESOLUTION_PX_DEFAULT,
+  );
+
+  return {
+    image_data_url_max_chars: imageDataUrlMaxChars,
+    image_max_resolution_px: imageMaxResolutionPx,
+  };
+}
+
+function decodeDataUrlImage(dataUrl) {
+  const m = String(dataUrl || "").match(/^data:([^;,]+);base64,(.+)$/i);
+  if (!m) {
+    throw new Error("Ongeldige data-url voor afbeelding");
+  }
+  return {
+    mime: String(m[1] || "").toLowerCase(),
+    base64: String(m[2] || ""),
+  };
+}
+
+function pickOutputFormat(mime) {
+  const m = String(mime || "").toLowerCase();
+  if (m.includes("png")) return { format: "png", mime: "image/png" };
+  if (m.includes("webp")) return { format: "webp", mime: "image/webp" };
+  if (m.includes("gif")) return { format: "png", mime: "image/png" };
+  return { format: "jpeg", mime: "image/jpeg" };
+}
+
+async function normalizeImageDataUrl(dataUrl, options = {}) {
+  const { mime, base64 } = decodeDataUrlImage(dataUrl);
+  const inputBuffer = Buffer.from(base64, "base64");
+  const maxResolutionPx = Math.max(512, Number.parseInt(String(options.max_resolution_px || "1568"), 10) || 1568);
+  const maxChars = Math.max(50000, Number.parseInt(String(options.max_chars || "450000"), 10) || 450000);
+
+  const inputMeta = await sharp(inputBuffer).metadata();
+  const width = Number(inputMeta.width || 0);
+  const height = Number(inputMeta.height || 0);
+  const longestEdge = Math.max(width, height);
+  const needsResize = longestEdge > maxResolutionPx;
+
+  let pipeline = sharp(inputBuffer, { animated: false }).rotate();
+  if (needsResize) {
+    pipeline = pipeline.resize({
+      width: maxResolutionPx,
+      height: maxResolutionPx,
+      fit: "inside",
+      withoutEnlargement: true,
+      kernel: "lanczos3",
+    });
+  }
+
+  const picked = pickOutputFormat(mime);
+  if (picked.format === "jpeg") {
+    pipeline = pipeline.jpeg({ quality: 82, mozjpeg: true });
+  } else if (picked.format === "png") {
+    pipeline = pipeline.png({ compressionLevel: 9, palette: true });
+  } else {
+    pipeline = pipeline.webp({ quality: 82 });
+  }
+
+  let outputBuffer = await pipeline.toBuffer();
+  let outMime = picked.mime;
+  let outputDataUrl = `data:${outMime};base64,${outputBuffer.toString("base64")}`;
+
+  // Second pass to enforce max char budget if still oversized.
+  if (outputDataUrl.length > maxChars) {
+    const fallbackBuffer = await sharp(outputBuffer)
+      .resize({ width: Math.min(maxResolutionPx, 1024), height: Math.min(maxResolutionPx, 1024), fit: "inside", withoutEnlargement: true })
+      .jpeg({ quality: 74, mozjpeg: true })
+      .toBuffer();
+    outputBuffer = fallbackBuffer;
+    outMime = "image/jpeg";
+    outputDataUrl = `data:${outMime};base64,${outputBuffer.toString("base64")}`;
+  }
+
+  const outMeta = await sharp(outputBuffer).metadata();
+  return {
+    image_data_url: outputDataUrl,
+    changed: outputDataUrl !== String(dataUrl || ""),
+    input: {
+      mime,
+      width,
+      height,
+      chars: String(dataUrl || "").length,
+    },
+    output: {
+      mime: outMime,
+      width: Number(outMeta.width || 0),
+      height: Number(outMeta.height || 0),
+      chars: outputDataUrl.length,
+    },
+  };
+}
+
+function validateCrawlerConfig(input) {
+  if (!input || typeof input !== "object") {
+    throw new Error("Crawler-configuratie ontbreekt of is ongeldig");
+  }
+
+  const cfg = {
+    enabled: Boolean(input.enabled),
+    timezone: String(input.timezone || "Europe/Amsterdam").trim() || "Europe/Amsterdam",
+    crawl_interval_minutes: Math.max(
+      15,
+      Number.parseInt(String(input.crawl_interval_minutes || "1440"), 10) || 1440,
+    ),
+    max_pages_per_run: Math.max(
+      10,
+      Number.parseInt(String(input.max_pages_per_run || "200"), 10) || 200,
+    ),
+    max_depth: Math.max(1, Number.parseInt(String(input.max_depth || "3"), 10) || 3),
+    request_timeout_ms: Math.max(
+      3000,
+      Number.parseInt(String(input.request_timeout_ms || "15000"), 10) || 15000,
+    ),
+    user_agent:
+      String(input.user_agent || "GovChatCrawler/1.0 (+https://govchat.nl)").trim() ||
+      "GovChatCrawler/1.0 (+https://govchat.nl)",
+    respect_robots_txt: input.respect_robots_txt !== false,
+    include_file_types: Array.isArray(input.include_file_types)
+      ? input.include_file_types.map((v) => String(v || "").trim()).filter(Boolean)
+      : ["text/html", "application/pdf"],
+    embedding_enabled: input.embedding_enabled !== false,
+    embedding_model: String(input.embedding_model || "govchat-embedding").trim() || "govchat-embedding",
+    embedding_max_chars: Math.max(
+      1000,
+      Number.parseInt(String(input.embedding_max_chars || "8000"), 10) || 8000,
+    ),
+    skip_embedding_for_unchanged: input.skip_embedding_for_unchanged !== false,
+    sources: [],
+  };
+
+  const rawSources = Array.isArray(input.sources) ? input.sources : [];
+  for (let i = 0; i < rawSources.length; i += 1) {
+    const s = rawSources[i] || {};
+    const id = String(s.id || `source-${i + 1}`).trim();
+    const name = String(s.name || id).trim();
+    const startUrl = String(s.start_url || "").trim();
+    if (!startUrl) {
+      throw new Error(`Bron ${i + 1} mist start_url`);
+    }
+    let urlObj;
+    try {
+      urlObj = new URL(startUrl);
+    } catch {
+      throw new Error(`Bron ${i + 1} heeft ongeldige start_url`);
+    }
+    if (!["http:", "https:"].includes(urlObj.protocol)) {
+      throw new Error(`Bron ${i + 1} gebruikt geen http/https URL`);
+    }
+
+    cfg.sources.push({
+      id,
+      name,
+      enabled: s.enabled !== false,
+      start_url: startUrl,
+      sitemap_urls: Array.isArray(s.sitemap_urls)
+        ? s.sitemap_urls.map((v) => String(v || "").trim()).filter(Boolean)
+        : [],
+      allowed_domains: Array.isArray(s.allowed_domains)
+        ? s.allowed_domains.map((v) => String(v || "").trim().toLowerCase()).filter(Boolean)
+        : [urlObj.hostname.toLowerCase()],
+      allowed_path_prefixes: Array.isArray(s.allowed_path_prefixes)
+        ? s.allowed_path_prefixes.map((v) => String(v || "").trim()).filter(Boolean)
+        : ["/"],
+      include_subdomains: s.include_subdomains !== false,
+      max_pages: Math.max(1, Number.parseInt(String(s.max_pages || "75"), 10) || 75),
+      max_depth: Math.max(1, Number.parseInt(String(s.max_depth || cfg.max_depth), 10) || cfg.max_depth),
+      interval_minutes: Math.max(
+        15,
+        Number.parseInt(String(s.interval_minutes || cfg.crawl_interval_minutes), 10) ||
+          cfg.crawl_interval_minutes,
+      ),
+    });
+  }
+
+  return cfg;
+}
+
+function readCrawlerRuns() {
+  const data = readJSON("crawler-runs.json");
+  if (!data || typeof data !== "object") return [];
+  return Array.isArray(data.runs) ? data.runs : [];
+}
+
+function toTimestamp(value) {
+  const ts = Date.parse(String(value || "").trim());
+  return Number.isNaN(ts) ? 0 : ts;
+}
+
+function normalizeWebsitePart(value, fallback = "unknown") {
+  const out = String(value || "").trim().toLowerCase();
+  return out || fallback;
+}
+
+function hostFromUrl(value) {
+  try {
+    return new URL(String(value || "").trim()).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function deriveWebsiteFromIndexedPage(page) {
+  const url = String(page?.url || "").trim();
+  const host = hostFromUrl(url);
+  const domain = normalizeWebsitePart(page?.domain || host || "unknown-domain", "unknown-domain");
+  const subwebsite = normalizeWebsitePart(page?.subwebsite || host || domain, domain);
+  const sourceId = String(page?.source_id || page?.source_name || subwebsite || domain)
+    .trim()
+    .toLowerCase();
+  const sourceName = String(page?.source_name || page?.source_id || subwebsite || domain).trim();
+  const websiteId = `${domain}::${subwebsite}::${sourceId}`;
+  return {
+    website_id: websiteId,
+    domain,
+    subwebsite,
+    source_id: sourceId,
+    source_name: sourceName,
+    url,
+    path: String(page?.path || "").trim() || "/",
+  };
+}
+
+function recalculateTokenUsageFromPages(indexedPages) {
+  const tokenUsage = {
+    total_input_tokens_est: 0,
+    total_prompt_tokens: 0,
+    total_tokens: 0,
+    by_domain: {},
+    by_subwebsite: {},
+  };
+
+  for (const page of Array.isArray(indexedPages) ? indexedPages : []) {
+    const { domain, subwebsite } = deriveWebsiteFromIndexedPage(page);
+    const inputTokensEst = Number(page?.input_tokens_est || 0);
+    const promptTokens = Number(page?.prompt_tokens || 0);
+    const totalTokens = Number(page?.total_tokens || inputTokensEst || 0);
+
+    tokenUsage.total_input_tokens_est += inputTokensEst;
+    tokenUsage.total_prompt_tokens += promptTokens;
+    tokenUsage.total_tokens += totalTokens;
+
+    if (!tokenUsage.by_domain[domain]) {
+      tokenUsage.by_domain[domain] = { pages: 0, total_tokens: 0, prompt_tokens: 0, input_tokens_est: 0 };
+    }
+    tokenUsage.by_domain[domain].pages += 1;
+    tokenUsage.by_domain[domain].total_tokens += totalTokens;
+    tokenUsage.by_domain[domain].prompt_tokens += promptTokens;
+    tokenUsage.by_domain[domain].input_tokens_est += inputTokensEst;
+
+    if (!tokenUsage.by_subwebsite[subwebsite]) {
+      tokenUsage.by_subwebsite[subwebsite] = {
+        pages: 0,
+        total_tokens: 0,
+        prompt_tokens: 0,
+        input_tokens_est: 0,
+      };
+    }
+    tokenUsage.by_subwebsite[subwebsite].pages += 1;
+    tokenUsage.by_subwebsite[subwebsite].total_tokens += totalTokens;
+    tokenUsage.by_subwebsite[subwebsite].prompt_tokens += promptTokens;
+    tokenUsage.by_subwebsite[subwebsite].input_tokens_est += inputTokensEst;
+  }
+
+  return tokenUsage;
+}
+
+function buildCrawlerWebsiteOverview() {
+  const runs = readCrawlerRuns();
+  const websiteMap = new Map();
+
+  for (const run of runs) {
+    const runId = String(run?.run_id || "").trim();
+    const runStatus = String(run?.status || "unknown").trim().toLowerCase() || "unknown";
+    const runFinishedAt = String(run?.finished_at || run?.started_at || "").trim();
+    const runPages = Array.isArray(run?.indexed_pages) ? run.indexed_pages : [];
+
+    for (const page of runPages) {
+      const meta = deriveWebsiteFromIndexedPage(page);
+      const indexedAt = String(page?.indexed_at || runFinishedAt || "").trim();
+      const indexedAtTs = toTimestamp(indexedAt);
+      const totalTokens = Number(page?.total_tokens || page?.input_tokens_est || 0);
+      const contentType = String(page?.content_type || "unknown").trim() || "unknown";
+
+      let website = websiteMap.get(meta.website_id);
+      if (!website) {
+        website = {
+          website_id: meta.website_id,
+          domain: meta.domain,
+          subwebsite: meta.subwebsite,
+          source_id: meta.source_id,
+          source_name: meta.source_name,
+          folder_path: `${meta.domain}/${meta.subwebsite}`,
+          first_indexed_at: indexedAt || null,
+          last_indexed_at: indexedAt || null,
+          last_run_id: runId || null,
+          last_run_status: runStatus,
+          total_pages_indexed: 0,
+          unique_url_count: 0,
+          total_tokens: 0,
+          content_types: {},
+          pages: [],
+          run_ids: new Set(),
+          unique_urls: new Set(),
+          _first_indexed_ts: indexedAtTs,
+          _last_indexed_ts: indexedAtTs,
+        };
+        websiteMap.set(meta.website_id, website);
+      }
+
+      website.total_pages_indexed += 1;
+      website.total_tokens += totalTokens;
+      website.content_types[contentType] = Number(website.content_types[contentType] || 0) + 1;
+      if (runId) website.run_ids.add(runId);
+      if (meta.url) website.unique_urls.add(meta.url);
+
+      if (indexedAtTs >= website._last_indexed_ts) {
+        website._last_indexed_ts = indexedAtTs;
+        website.last_indexed_at = indexedAt || website.last_indexed_at;
+        website.last_run_id = runId || website.last_run_id;
+        website.last_run_status = runStatus;
+      }
+      if (website._first_indexed_ts === 0 || (indexedAtTs > 0 && indexedAtTs <= website._first_indexed_ts)) {
+        website._first_indexed_ts = indexedAtTs;
+        website.first_indexed_at = indexedAt || website.first_indexed_at;
+      }
+
+      website.pages.push({
+        url: meta.url || null,
+        path: meta.path,
+        indexed_at: indexedAt || null,
+        content_type: contentType,
+        total_tokens: totalTokens,
+        embedding_status: String(page?.embedding_status || "-") || "-",
+        run_id: runId || null,
+      });
+    }
+  }
+
+  const websites = [...websiteMap.values()]
+    .map((website) => {
+      const pages = website.pages.sort((a, b) => toTimestamp(b.indexed_at) - toTimestamp(a.indexed_at));
+      const recentPages = pages.slice(0, 8);
+      return {
+        website_id: website.website_id,
+        domain: website.domain,
+        subwebsite: website.subwebsite,
+        source_id: website.source_id,
+        source_name: website.source_name,
+        folder_path: website.folder_path,
+        first_indexed_at: website.first_indexed_at,
+        last_indexed_at: website.last_indexed_at,
+        last_run_id: website.last_run_id,
+        last_run_status: website.last_run_status,
+        total_pages_indexed: website.total_pages_indexed,
+        unique_url_count: website.unique_urls.size,
+        runs_indexed: website.run_ids.size,
+        total_tokens: website.total_tokens,
+        content_types: website.content_types,
+        recent_pages: recentPages,
+        pages,
+      };
+    })
+    .sort((a, b) => toTimestamp(b.last_indexed_at) - toTimestamp(a.last_indexed_at));
+
+  const domainMap = new Map();
+  for (const website of websites) {
+    if (!domainMap.has(website.domain)) {
+      domainMap.set(website.domain, {
+        key: website.domain,
+        name: website.domain,
+        total_websites: 0,
+        total_pages_indexed: 0,
+        last_indexed_at: website.last_indexed_at,
+        subfoldersMap: new Map(),
+      });
+    }
+    const domainEntry = domainMap.get(website.domain);
+    domainEntry.total_websites += 1;
+    domainEntry.total_pages_indexed += Number(website.total_pages_indexed || 0);
+    if (toTimestamp(website.last_indexed_at) > toTimestamp(domainEntry.last_indexed_at)) {
+      domainEntry.last_indexed_at = website.last_indexed_at;
+    }
+
+    const subKey = website.subwebsite;
+    if (!domainEntry.subfoldersMap.has(subKey)) {
+      domainEntry.subfoldersMap.set(subKey, {
+        key: `${website.domain}/${subKey}`,
+        name: subKey,
+        total_websites: 0,
+        total_pages_indexed: 0,
+        last_indexed_at: website.last_indexed_at,
+        websites: [],
+      });
+    }
+    const subEntry = domainEntry.subfoldersMap.get(subKey);
+    subEntry.total_websites += 1;
+    subEntry.total_pages_indexed += Number(website.total_pages_indexed || 0);
+    if (toTimestamp(website.last_indexed_at) > toTimestamp(subEntry.last_indexed_at)) {
+      subEntry.last_indexed_at = website.last_indexed_at;
+    }
+    subEntry.websites.push({
+      website_id: website.website_id,
+      source_name: website.source_name,
+      source_id: website.source_id,
+      total_pages_indexed: website.total_pages_indexed,
+      unique_url_count: website.unique_url_count,
+      runs_indexed: website.runs_indexed,
+      total_tokens: website.total_tokens,
+      last_indexed_at: website.last_indexed_at,
+      last_run_status: website.last_run_status,
+      first_indexed_at: website.first_indexed_at,
+    });
+  }
+
+  const folders = [...domainMap.values()]
+    .map((domainEntry) => ({
+      key: domainEntry.key,
+      name: domainEntry.name,
+      total_websites: domainEntry.total_websites,
+      total_pages_indexed: domainEntry.total_pages_indexed,
+      last_indexed_at: domainEntry.last_indexed_at,
+      subfolders: [...domainEntry.subfoldersMap.values()]
+        .map((subEntry) => ({
+          key: subEntry.key,
+          name: subEntry.name,
+          total_websites: subEntry.total_websites,
+          total_pages_indexed: subEntry.total_pages_indexed,
+          last_indexed_at: subEntry.last_indexed_at,
+          websites: subEntry.websites.sort((a, b) => toTimestamp(b.last_indexed_at) - toTimestamp(a.last_indexed_at)),
+        }))
+        .sort((a, b) => toTimestamp(b.last_indexed_at) - toTimestamp(a.last_indexed_at)),
+    }))
+    .sort((a, b) => toTimestamp(b.last_indexed_at) - toTimestamp(a.last_indexed_at));
+
+  const totalPagesIndexed = websites.reduce((sum, w) => sum + Number(w.total_pages_indexed || 0), 0);
+  const totalTokens = websites.reduce((sum, w) => sum + Number(w.total_tokens || 0), 0);
+  const subwebsiteCount = folders.reduce((sum, domainEntry) => sum + (domainEntry.subfolders?.length || 0), 0);
+
+  return {
+    generated_at: new Date().toISOString(),
+    totals: {
+      websites_count: websites.length,
+      domains_count: folders.length,
+      subwebsites_count: subwebsiteCount,
+      pages_indexed: totalPagesIndexed,
+      total_tokens: totalTokens,
+    },
+    folders,
+    websites,
+  };
+}
+
+function removeWebsiteFromCrawlerRuns(websiteId) {
+  const targetId = String(websiteId || "").trim();
+  if (!targetId) {
+    return { removed_pages: 0, affected_runs: 0, changed: false };
+  }
+
+  const runs = readCrawlerRuns();
+  let removedPages = 0;
+  let affectedRuns = 0;
+  let changed = false;
+
+  const updatedRuns = runs.map((run) => {
+    const pages = Array.isArray(run?.indexed_pages) ? run.indexed_pages : [];
+    if (!pages.length) return run;
+
+    const filteredPages = pages.filter((page) => deriveWebsiteFromIndexedPage(page).website_id !== targetId);
+    const removedForRun = pages.length - filteredPages.length;
+    if (removedForRun <= 0) return run;
+
+    removedPages += removedForRun;
+    affectedRuns += 1;
+    changed = true;
+
+    return {
+      ...run,
+      indexed_pages: filteredPages,
+      token_usage: recalculateTokenUsageFromPages(filteredPages),
+      summary: {
+        ...(run?.summary && typeof run.summary === "object" ? run.summary : {}),
+        indexed_items: filteredPages.length,
+      },
+    };
+  });
+
+  if (changed) {
+    writeCrawlerRuns(updatedRuns);
+  }
+
+  return {
+    removed_pages: removedPages,
+    affected_runs: affectedRuns,
+    changed,
+  };
+}
+
+function getCrawlerRun(runId) {
+  const id = String(runId || "").trim();
+  if (!id) return null;
+  return readCrawlerRuns().find((r) => String(r?.run_id || "") === id) || null;
+}
+
+function writeCrawlerRuns(runs) {
+  const sorted = [...runs]
+    .sort((a, b) => Date.parse(b.finished_at || b.created_at || 0) - Date.parse(a.finished_at || a.created_at || 0))
+    .slice(0, CRAWLER_RUNS_LIMIT);
+  writeJSON("crawler-runs.json", { runs: sorted });
+}
+
+function upsertCrawlerRun(runPartial) {
+  const runs = readCrawlerRuns();
+  const runId = String(runPartial?.run_id || runPartial?.id || "").trim() || crypto.randomUUID();
+  const now = new Date().toISOString();
+  const existingIndex = runs.findIndex((r) => String(r?.run_id || "") === runId);
+
+  const next = {
+    run_id: runId,
+    created_at: String(runPartial?.created_at || runPartial?.started_at || now),
+    status: String(runPartial?.status || "finished").trim() || "finished",
+    trigger: String(runPartial?.trigger || "manual").trim() || "manual",
+    started_at: String(runPartial?.started_at || now),
+    finished_at: String(runPartial?.finished_at || now),
+    summary: runPartial?.summary && typeof runPartial.summary === "object" ? runPartial.summary : {},
+    indexed_pages: Array.isArray(runPartial?.indexed_pages) ? runPartial.indexed_pages : [],
+    token_usage: runPartial?.token_usage && typeof runPartial.token_usage === "object"
+      ? runPartial.token_usage
+      : {},
+    error: runPartial?.error ? String(runPartial.error) : null,
+  };
+
+  if (existingIndex >= 0) {
+    runs[existingIndex] = {
+      ...runs[existingIndex],
+      ...next,
+      summary: {
+        ...(runs[existingIndex]?.summary || {}),
+        ...(next.summary || {}),
+      },
+      token_usage: {
+        ...(runs[existingIndex]?.token_usage || {}),
+        ...(next.token_usage || {}),
+      },
+    };
+  } else {
+    runs.push(next);
+  }
+
+  writeCrawlerRuns(runs);
+  return next;
+}
+
+function requestCrawlerRunCancel(runId, requestedBy = "admin-ui") {
+  const existing = getCrawlerRun(runId);
+  if (!existing) {
+    return { ok: false, notFound: true, run: null };
+  }
+
+  const terminal = new Set(["finished", "failed", "cancelled", "skipped"]);
+  const status = String(existing.status || "").trim().toLowerCase();
+  if (terminal.has(status)) {
+    return { ok: false, terminal: true, run: existing };
+  }
+
+  const now = new Date().toISOString();
+  const next = upsertCrawlerRun({
+    run_id: existing.run_id,
+    status: "cancel_requested",
+    trigger: existing.trigger || "manual",
+    started_at: existing.started_at || now,
+    finished_at: existing.finished_at || now,
+    summary: {
+      ...(existing.summary || {}),
+      cancel_requested_at: now,
+      cancel_requested_by: requestedBy,
+    },
+    indexed_pages: existing.indexed_pages || [],
+    token_usage: existing.token_usage || {},
+    error: existing.error || null,
+  });
+
+  return { ok: true, run: next };
+}
+
+function imageJobsDir() {
+  return path.join(DATA_DIR, "image-jobs");
+}
+
+function ensureImageJobsDir() {
+  const dir = imageJobsDir();
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+}
+
+function imageJobFilepath(jobId) {
+  return path.join(imageJobsDir(), `${jobId}.json`);
+}
+
+function saveImageJob(job) {
+  ensureImageJobsDir();
+  fs.writeFileSync(imageJobFilepath(job.id), JSON.stringify(job, null, 2), "utf-8");
+}
+
+function extractToken(req) {
+  const auth = String(req.headers.authorization || "").trim();
+  if (auth.toLowerCase().startsWith("bearer ")) {
+    return auth.slice(7).trim();
+  }
+  return String(req.headers["x-govchat-token"] || "").trim();
+}
+
+function requireImageJobsAuth(req, res, next) {
+  if (!IMAGE_JOBS_ENABLED) {
+    return res.status(404).json({ error: "Image jobs endpoint staat uit" });
+  }
+  if (!IMAGE_JOBS_TOKEN) {
+    return res.status(503).json({ error: "Server misconfiguratie: IMAGE_JOBS_TOKEN ontbreekt" });
+  }
+
+  const supplied = extractToken(req);
+  if (!supplied || supplied !== IMAGE_JOBS_TOKEN) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  return next();
+}
+
+function requireCrawlerInternalAuth(req, res, next) {
+  if (!CRAWLER_INTERNAL_TOKEN) {
+    return res.status(503).json({ error: "Server misconfiguratie: CRAWLER_INTERNAL_TOKEN ontbreekt" });
+  }
+
+  const supplied = extractToken(req);
+  if (!supplied || supplied !== CRAWLER_INTERNAL_TOKEN) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  return next();
+}
+
+async function triggerCrawlerRun({ trigger = "manual", requestedBy = "admin-ui" } = {}) {
+  if (!CRAWLER_N8N_WEBHOOK_TOKEN) {
+    throw new Error("CRAWLER_N8N_WEBHOOK_TOKEN ontbreekt");
+  }
+
+  const runId = crypto.randomUUID();
+  const startedAt = new Date().toISOString();
+  upsertCrawlerRun({
+    run_id: runId,
+    status: "running",
+    trigger,
+    started_at: startedAt,
+    finished_at: startedAt,
+    summary: {
+      requested_at: startedAt,
+      requested_by: requestedBy,
+    },
+  });
+
+  const response = await fetch(CRAWLER_N8N_WEBHOOK_URL, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-govchat-token": CRAWLER_N8N_WEBHOOK_TOKEN,
+    },
+    body: JSON.stringify({
+      run_id: runId,
+      trigger,
+      requested_by: requestedBy,
+      requested_at: new Date().toISOString(),
+    }),
+    signal: AbortSignal.timeout(30000),
+  });
+
+  let payload = null;
+  const raw = await response.text();
+  try {
+    payload = raw ? JSON.parse(raw) : {};
+  } catch {
+    payload = { raw };
+  }
+
+  if (!response.ok) {
+    const msg = String(payload?.error || payload?.message || raw || "").trim();
+    upsertCrawlerRun({
+      run_id: runId,
+      status: "failed",
+      trigger,
+      started_at: startedAt,
+      finished_at: new Date().toISOString(),
+      error: msg || `Crawler webhook gaf HTTP ${response.status}`,
+    });
+    throw new Error(msg || `Crawler webhook gaf HTTP ${response.status}`);
+  }
+
+  return {
+    run_id: String(payload?.run_id || runId).trim() || runId,
+    response: payload,
+  };
+}
+
+function statusMessage(status) {
+  if (status === "queued") return "Je afbeelding staat in de wachtrij.";
+  if (status === "running") return "Je afbeelding wordt nu gegenereerd.";
+  if (status === "succeeded") return "Je afbeelding is klaar.";
+  if (status === "failed") return "Afbeelding genereren is mislukt.";
+  return "Onbekende status.";
+}
+
+function toPublicImageJob(job) {
+  return {
+    job_id: job.id,
+    status: job.status,
+    message: statusMessage(job.status),
+    created_at: job.created_at,
+    updated_at: job.updated_at,
+    started_at: job.started_at || null,
+    completed_at: job.completed_at || null,
+    prompt: job.prompt,
+    size: job.size,
+    quality: job.quality,
+    image_url: job.image_url || null,
+    markdown: job.markdown || null,
+    result_text: job.result_text || null,
+    error: job.error || null,
+    poll_after_ms: job.status === "queued" || job.status === "running" ? 1200 : 0,
+  };
+}
+
+function updateImageJob(job, partial) {
+  const updated = {
+    ...job,
+    ...partial,
+    updated_at: new Date().toISOString(),
+  };
+  imageJobs.set(updated.id, updated);
+  saveImageJob(updated);
+  return updated;
+}
+
+function loadPersistedImageJobs() {
+  if (!IMAGE_JOBS_ENABLED) return;
+
+  ensureImageJobsDir();
+  const entries = fs
+    .readdirSync(imageJobsDir(), { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".json"));
+
+  for (const entry of entries) {
+    const raw = fs.readFileSync(path.join(imageJobsDir(), entry.name), "utf-8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || !parsed.id || !parsed.status) continue;
+
+    if (parsed.status === "running") {
+      parsed.status = "queued";
+      parsed.updated_at = new Date().toISOString();
+      parsed.error = null;
+    }
+
+    imageJobs.set(parsed.id, parsed);
+    if (parsed.status === "queued") {
+      imageJobQueue.push(parsed.id);
+    }
+  }
+}
+
+function cleanupImageJobs() {
+  if (!IMAGE_JOBS_ENABLED) return;
+
+  const now = Date.now();
+  const ttlMs = IMAGE_JOBS_TTL_HOURS * 60 * 60 * 1000;
+  const terminal = new Set(["succeeded", "failed"]);
+
+  for (const [jobId, job] of imageJobs.entries()) {
+    if (!terminal.has(job.status)) continue;
+    const updatedAt = Date.parse(job.updated_at || "");
+    if (Number.isNaN(updatedAt)) continue;
+    if (now - updatedAt < ttlMs) continue;
+
+    imageJobs.delete(jobId);
+    const fp = imageJobFilepath(jobId);
+    if (fs.existsSync(fp)) {
+      fs.unlinkSync(fp);
+    }
+  }
+}
+
+async function runImageJob(jobId) {
+  const existing = imageJobs.get(jobId);
+  if (!existing) return;
+
+  if (!IMAGE_JOBS_WEBHOOK_TOKEN) {
+    updateImageJob(existing, {
+      status: "failed",
+      completed_at: new Date().toISOString(),
+      error: "Server misconfiguratie: IMAGE_JOBS_WEBHOOK_TOKEN ontbreekt",
+    });
+    return;
+  }
+
+  const running = updateImageJob(existing, {
+    status: "running",
+    started_at: new Date().toISOString(),
+    error: null,
+  });
+
+  try {
+    const res = await fetch(IMAGE_JOBS_WEBHOOK_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-govchat-token": IMAGE_JOBS_WEBHOOK_TOKEN,
+      },
+      body: JSON.stringify({
+        prompt: running.prompt,
+        size: running.size,
+        quality: running.quality,
+      }),
+      signal: AbortSignal.timeout(240000),
+    });
+
+    const raw = await res.text();
+    let payload = null;
+    try {
+      payload = raw ? JSON.parse(raw) : {};
+    } catch {
+      payload = { response: raw };
+    }
+
+    if (!res.ok) {
+      const msg = String(payload?.error || payload?.message || raw || "").trim();
+      updateImageJob(running, {
+        status: "failed",
+        completed_at: new Date().toISOString(),
+        error: msg || `Image-webhook gaf HTTP ${res.status}`,
+      });
+      return;
+    }
+
+    const imageUrl = String(payload?.image_url || "").trim() || null;
+    const markdown = String(payload?.markdown || "").trim() || null;
+    const responseText = String(payload?.response || "").trim() || null;
+
+    updateImageJob(running, {
+      status: "succeeded",
+      completed_at: new Date().toISOString(),
+      image_url: imageUrl,
+      markdown,
+      result_text: responseText,
+      error: null,
+    });
+  } catch (err) {
+    updateImageJob(running, {
+      status: "failed",
+      completed_at: new Date().toISOString(),
+      error: String(err?.message || err || "Onbekende fout"),
+    });
+  }
+}
+
+function pumpImageJobs() {
+  if (!IMAGE_JOBS_ENABLED) return;
+
+  while (imageWorkersActive < IMAGE_JOBS_CONCURRENCY && imageJobQueue.length > 0) {
+    const nextJobId = imageJobQueue.shift();
+    if (!nextJobId) continue;
+
+    const nextJob = imageJobs.get(nextJobId);
+    if (!nextJob || nextJob.status !== "queued") continue;
+
+    imageWorkersActive += 1;
+
+    runImageJob(nextJobId)
+      .catch((err) => {
+        console.warn(`[image-jobs] Worker fout: ${err?.message || err}`);
+      })
+      .finally(() => {
+        imageWorkersActive = Math.max(0, imageWorkersActive - 1);
+        setImmediate(pumpImageJobs);
+      });
+  }
+}
+
+function createImageJob({ prompt, size, quality }) {
+  const now = new Date().toISOString();
+  const job = {
+    id: crypto.randomUUID(),
+    status: "queued",
+    created_at: now,
+    updated_at: now,
+    started_at: null,
+    completed_at: null,
+    prompt,
+    size,
+    quality,
+    image_url: null,
+    markdown: null,
+    result_text: null,
+    error: null,
+  };
+
+  imageJobs.set(job.id, job);
+  imageJobQueue.push(job.id);
+  saveImageJob(job);
+  setImmediate(pumpImageJobs);
+  return job;
 }
 
 // ── Auth helpers ───────────────────────────────────────────────────
@@ -150,6 +1181,10 @@ function sendView(res, name, vars = {}) {
   for (const [key, value] of Object.entries(vars)) {
     html = html.replaceAll(`{{${key}}}`, value);
   }
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+  res.set("Surrogate-Control", "no-store");
   res.type("html").send(html);
 }
 
@@ -164,6 +1199,102 @@ app.get("/api/config/apps", (req, res) => {
   const data = readJSON("apps.json");
   if (!data) return res.status(404).json({ error: "Not found" });
   res.json(data);
+});
+
+app.get("/api/config/orchestrator", (req, res) => {
+  res.json(readOrchestratorConfig());
+});
+
+app.post("/api/config/orchestrator/normalize-image", async (req, res) => {
+  try {
+    const imageDataUrl = String(req.body?.image_data_url || "").trim();
+    if (!imageDataUrl.startsWith("data:")) {
+      return res.status(400).json({ error: "Veld image_data_url met geldige data-url is verplicht" });
+    }
+
+    const cfg = readOrchestratorConfig();
+    const normalized = await normalizeImageDataUrl(imageDataUrl, {
+      max_resolution_px: req.body?.max_resolution_px || cfg.image_max_resolution_px,
+      max_chars: req.body?.max_chars || cfg.image_data_url_max_chars,
+    });
+
+    return res.json({ ok: true, ...normalized });
+  } catch (err) {
+    return res.status(400).json({ error: err?.message || String(err) });
+  }
+});
+
+app.get("/api/crawler/internal/config", requireCrawlerInternalAuth, (req, res) => {
+  res.json(readCrawlerConfig());
+});
+
+app.get("/api/crawler/internal/runs", requireCrawlerInternalAuth, (req, res) => {
+  const limit = Math.max(1, Number.parseInt(String(req.query.limit || "50"), 10) || 50);
+  const runs = readCrawlerRuns().slice(0, limit);
+  res.json({ runs });
+});
+
+app.get("/api/crawler/internal/runs/:runId/cancelled", requireCrawlerInternalAuth, (req, res) => {
+  const runId = String(req.params.runId || "").trim();
+  const run = getCrawlerRun(runId);
+  if (!run) {
+    return res.status(404).json({ error: "Run niet gevonden", cancel_requested: false });
+  }
+  const status = String(run.status || "").trim().toLowerCase();
+  const cancelRequested = status === "cancel_requested" || status === "cancelled";
+  return res.json({
+    run_id: runId,
+    status,
+    cancel_requested: cancelRequested,
+  });
+});
+
+app.post("/api/crawler/internal/runs", requireCrawlerInternalAuth, (req, res) => {
+  try {
+    let payload = req.body;
+    if (typeof payload === "string") {
+      try {
+        payload = JSON.parse(payload);
+      } catch {
+        payload = { error: payload };
+      }
+    }
+    const run = upsertCrawlerRun(payload || {});
+    return res.json({ ok: true, run });
+  } catch (err) {
+    return res.status(400).json({ error: err.message || String(err) });
+  }
+});
+
+app.post("/api/image-jobs", requireImageJobsAuth, (req, res) => {
+  const prompt = String(req.body?.prompt || "").trim();
+  const size = String(req.body?.size || "1024x1024").trim();
+  const quality = String(req.body?.quality || "standard").trim();
+
+  if (!prompt) {
+    return res.status(400).json({ error: "Veld \"prompt\" is verplicht" });
+  }
+
+  if (prompt.length > 3000) {
+    return res.status(400).json({ error: "Prompt is te lang (maximaal 3000 tekens)" });
+  }
+
+  const job = createImageJob({ prompt, size, quality });
+  return res.status(202).json({
+    ...toPublicImageJob(job),
+    status_url: `/api/image-jobs/${job.id}`,
+    result_url: `/api/image-jobs/${job.id}`,
+  });
+});
+
+app.get("/api/image-jobs/:jobId", requireImageJobsAuth, (req, res) => {
+  const jobId = String(req.params.jobId || "").trim();
+  const job = imageJobs.get(jobId);
+  if (!job) {
+    return res.status(404).json({ error: "Job niet gevonden" });
+  }
+
+  return res.json(toPublicImageJob(job));
 });
 
 // ── Login ──────────────────────────────────────────────────────────
@@ -203,13 +1334,31 @@ app.get("/", (req, res) => {
 app.get("/dashboard", requireAuth, (req, res) => {
   const helpData = readJSON("help-content.json");
   const appsData = readJSON("apps.json");
+  const crawlerConfig = readCrawlerConfig();
+  const orchestratorConfig = readOrchestratorConfig();
   const helpSections = helpData?.sections?.length || 0;
   const appCount = appsData?.apps?.length || 0;
   sendView(res, "dashboard.html", {
     helpSections: String(helpSections),
     appCount: String(appCount),
+    crawlerSources: String(crawlerConfig?.sources?.filter((s) => s?.enabled !== false).length || 0),
+    crawlerEnabled: crawlerConfig?.enabled ? "Actief" : "Uitgeschakeld",
+    orchestratorImageCap: String(orchestratorConfig?.image_data_url_max_chars || ORCHESTRATOR_IMAGE_DATA_URL_MAX_CHARS_DEFAULT),
     helpTitle: helpData?.title || "(niet ingesteld)",
     appsTitle: appsData?.title || "(niet ingesteld)",
+  });
+});
+
+app.get("/crawler-editor", requireAuth, (req, res) => {
+  sendView(res, "crawler-editor.html", {
+    jsonData: JSON.stringify(readCrawlerConfig()),
+    orchestratorData: JSON.stringify(readOrchestratorConfig()),
+  });
+});
+
+app.get("/orchestrator-editor", requireAuth, (req, res) => {
+  sendView(res, "orchestrator-editor.html", {
+    orchestratorData: JSON.stringify(readOrchestratorConfig()),
   });
 });
 
@@ -246,8 +1395,127 @@ app.post("/api/config/apps", requireAuth, (req, res) => {
   }
 });
 
+app.get("/api/crawler/config", requireAuth, (req, res) => {
+  res.json(readCrawlerConfig());
+});
+
+app.post("/api/crawler/config", requireAuth, (req, res) => {
+  try {
+    const next = validateCrawlerConfig(req.body || {});
+    writeJSON("crawler-config.json", next);
+    return res.json({ ok: true, config: next });
+  } catch (err) {
+    return res.status(400).json({ error: err.message || String(err) });
+  }
+});
+
+app.get("/api/orchestrator/config", requireAuth, (req, res) => {
+  res.json(readOrchestratorConfig());
+});
+
+app.post("/api/orchestrator/config", requireAuth, (req, res) => {
+  try {
+    const next = validateOrchestratorConfig(req.body || {});
+    writeJSON("orchestrator-config.json", next);
+    return res.json({ ok: true, config: next });
+  } catch (err) {
+    return res.status(400).json({ error: err.message || String(err) });
+  }
+});
+
+app.get("/api/crawler/runs", requireAuth, (req, res) => {
+  const limit = Math.max(1, Number.parseInt(String(req.query.limit || "50"), 10) || 50);
+  const runs = readCrawlerRuns().slice(0, limit);
+  res.json({ runs });
+});
+
+app.get("/api/crawler/websites", requireAuth, (req, res) => {
+  const overview = buildCrawlerWebsiteOverview();
+  const includePages = String(req.query.include_pages || "").trim().toLowerCase() === "true";
+  if (!includePages) {
+    overview.websites = overview.websites.map((website) => {
+      const { pages, ...rest } = website;
+      return rest;
+    });
+  }
+  return res.json(overview);
+});
+
+app.get("/api/crawler/websites/:websiteId", requireAuth, (req, res) => {
+  const websiteId = String(req.params.websiteId || "").trim();
+  if (!websiteId) {
+    return res.status(400).json({ error: "websiteId ontbreekt" });
+  }
+  const overview = buildCrawlerWebsiteOverview();
+  const website = overview.websites.find((entry) => entry.website_id === websiteId);
+  if (!website) {
+    return res.status(404).json({ error: "Website niet gevonden" });
+  }
+  return res.json({ website });
+});
+
+app.delete("/api/crawler/websites/:websiteId", requireAuth, (req, res) => {
+  const websiteId = String(req.params.websiteId || "").trim();
+  if (!websiteId) {
+    return res.status(400).json({ error: "websiteId ontbreekt" });
+  }
+
+  const before = buildCrawlerWebsiteOverview();
+  const exists = before.websites.some((website) => website.website_id === websiteId);
+  if (!exists) {
+    return res.status(404).json({ error: "Website niet gevonden" });
+  }
+
+  const removal = removeWebsiteFromCrawlerRuns(websiteId);
+  const after = buildCrawlerWebsiteOverview();
+  return res.json({
+    ok: true,
+    removed: {
+      website_id: websiteId,
+      affected_runs: removal.affected_runs,
+      removed_pages: removal.removed_pages,
+    },
+    totals: after.totals,
+  });
+});
+
+app.post("/api/crawler/run", requireAuth, async (req, res) => {
+  try {
+    const result = await triggerCrawlerRun({
+      trigger: "manual",
+      requestedBy: "admin-ui",
+    });
+    res.status(202).json({ ok: true, run_id: result.run_id, n8n: result.response || null });
+  } catch (err) {
+    res.status(502).json({ error: String(err?.message || err || "Crawler run starten mislukt") });
+  }
+});
+
+app.post("/api/crawler/run/:runId/cancel", requireAuth, (req, res) => {
+  const runId = String(req.params.runId || "").trim();
+  if (!runId) {
+    return res.status(400).json({ error: "runId ontbreekt" });
+  }
+
+  const result = requestCrawlerRunCancel(runId, "admin-ui");
+  if (result.notFound) {
+    return res.status(404).json({ error: "Run niet gevonden" });
+  }
+  if (result.terminal) {
+    return res.status(409).json({ error: "Run is al afgerond", run: result.run });
+  }
+  if (!result.ok) {
+    return res.status(400).json({ error: "Annuleren mislukt" });
+  }
+
+  return res.json({ ok: true, run: result.run });
+});
+
 // ── Start ──────────────────────────────────────────────────────────
 initDefaults();
+loadPersistedImageJobs();
+setInterval(cleanupImageJobs, 10 * 60 * 1000);
+setImmediate(pumpImageJobs);
 
 // Wait a bit for Open WebUI to finish its startup copy, then publish admin data
 setTimeout(() => {
@@ -259,4 +1527,12 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`[govchat-admin] Running on http://0.0.0.0:${PORT}`);
   console.log(`[govchat-admin] Data directory: ${DATA_DIR}`);
   console.log(`[govchat-admin] Publish directory: ${PUBLISH_DIR}`);
+  if (IMAGE_JOBS_ENABLED) {
+    console.log(`[govchat-admin] Image jobs enabled (concurrency=${IMAGE_JOBS_CONCURRENCY})`);
+  } else {
+    console.log("[govchat-admin] Image jobs disabled");
+  }
+  console.log(
+    `[govchat-admin] Crawler webhook: ${CRAWLER_N8N_WEBHOOK_URL} (internal token configured=${Boolean(CRAWLER_INTERNAL_TOKEN)})`,
+  );
 });
