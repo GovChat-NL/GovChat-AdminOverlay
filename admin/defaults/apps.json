@@ -21,6 +21,23 @@
                 "language_levels": ["B1", "B2"],
                 "default_level": "B1"
             }
+        },
+        {
+            "id": "transcriptie",
+            "name": "Live transcriptie",
+            "icon": "\uD83C\uDFA4",
+            "description": "Live spraak-naar-tekst met sprekerbeheer",
+            "url": "https://n8n.example.com/webhook/transcriptie-litellm",
+            "target": "transcriptie",
+            "config": {
+                "webhook_token": "change-me",
+                "chunk_ms": 5000,
+                "max_duration_minutes": 120,
+                "litellm_model": "whisper",
+                "language": "nl",
+                "enable_speaker_labels": true,
+                "include_timestamps": true
+            }
         }
     ]
 }

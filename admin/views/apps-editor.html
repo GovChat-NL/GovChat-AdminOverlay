@@ -77,6 +77,7 @@
   .target-blank { background: #f0fdf4; color: #166534; }
   .target-iframe { background: #fef3c7; color: #92400e; }
   .target-versimpelaar { background: #fce7f3; color: #9d174d; }
+  .target-transcriptie { background: #ede9fe; color: #5b21b6; }
 </style>
 </head>
 <body>
@@ -231,6 +232,7 @@ const TARGET_TYPES = [
   { value: "blank", label: "Nieuw tabblad" },
   { value: "iframe", label: "Iframe viewer" },
   { value: "versimpelaar", label: "Versimpelaar" },
+  { value: "transcriptie", label: "Live transcriptie" },
 ];
 
 const TARGET_BADGES = {
@@ -238,6 +240,7 @@ const TARGET_BADGES = {
   blank: "target-blank",
   iframe: "target-iframe",
   versimpelaar: "target-versimpelaar",
+  transcriptie: "target-transcriptie",
 };
 
 function render() {
@@ -293,6 +296,110 @@ function renderApps() {
               <input type="text" value="${escAttr(defaultLevel)}" onchange="updateConfig(${ai}, 'default_level', this.value)">
             </div>
           </div>
+        </div>`;
+    } else if (app.target === "transcriptie") {
+      const cfg = app.config || {};
+      const webhookToken = cfg.webhook_token || "";
+      const chunkMs = Number(cfg.chunk_ms || 5000);
+      const chunkMinMs = Number(cfg.chunk_min_ms || 2200);
+      const chunkMaxMs = Number(cfg.chunk_max_ms || 12000);
+      const vadSilenceMs = Number(cfg.vad_silence_ms || 900);
+      const vadThreshold = Number(cfg.vad_threshold || 0.012);
+      const silenceThreshold = Number(cfg.silence_threshold ?? cfg.vad_threshold ?? 0.012);
+      const overlapMs = Number(cfg.overlap_ms || 650);
+      const contextPrompt = cfg.context_prompt || "Nederlands gesprek, maak een complete en nette transcriptie.";
+      const maxDuration = Number(cfg.max_duration_minutes || 120);
+      const model = cfg.litellm_model || "whisper";
+      const language = cfg.language || "nl";
+      const enableSpeakerLabels = cfg.enable_speaker_labels !== false;
+      const includeTimestamps = cfg.include_timestamps !== false;
+      configHTML = `
+        <div class="config-section">
+          <div class="config-label">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M12 18.75a6 6 0 0 0 5.878-4.788M12 18.75a6 6 0 0 1-5.878-4.788M12 18.75V21m-7.5-9.75h15m-15 0a7.5 7.5 0 0 1 15 0m-15 0a7.5 7.5 0 0 0 15 0m-15 0V9a7.5 7.5 0 0 1 15 0v2.25"/></svg>
+            Transcriptie instellingen
+          </div>
+          <div class="form-group">
+            <label>Webhook token</label>
+            <input type="text" value="${escAttr(webhookToken)}" onchange="updateConfig(${ai}, 'webhook_token', this.value)">
+            <div class="help-text"><strong>Doel:</strong> Beveiliging op de webhook.<br><strong>Waarde:</strong> vrije tekst/token.<br><strong>Advies:</strong> altijd invullen in productie.<br><strong>Voordeel hoog/ingevuld:</strong> veiliger endpoint.<br><strong>Nadeel:</strong> fout token = geen transcriptie.</div>
+          </div>
+          <div class="inline-row">
+            <div class="form-group">
+              <label>LiteLLM model</label>
+              <input type="text" value="${escAttr(model)}" onchange="updateConfig(${ai}, 'litellm_model', this.value)">
+              <div class="help-text"><strong>Doel:</strong> model-alias in LiteLLM (bijv. <code>whisper</code>).<br><strong>Waarde:</strong> tekst/aliasnaam.<br><strong>Advies:</strong> gebruik alleen een alias die in LiteLLM bestaat.<br><strong>Nadeel fout alias:</strong> 4xx/5xx modelfout.</div>
+            </div>
+            <div class="form-group" style="flex:0 0 120px;">
+              <label>Taal</label>
+              <input type="text" value="${escAttr(language)}" onchange="updateConfig(${ai}, 'language', this.value)">
+              <div class="help-text"><strong>Doel:</strong> taalhint voor transcriptie (ISO-code, bijv. <code>nl</code>).<br><strong>Voordeel juiste taal:</strong> betere herkenning.<br><strong>Nadeel verkeerde taal:</strong> meer fouten bij snelle spraak.</div>
+            </div>
+          </div>
+          <div class="inline-row">
+            <div class="form-group" style="flex:0 0 170px;">
+              <label>Chunk interval (ms)</label>
+              <input type="text" value="${escAttr(String(chunkMs))}" onchange="updateConfig(${ai}, 'chunk_ms', this.value)">
+              <div class="help-text"><strong>Doel:</strong> fallback vaste chunking (legacy).<br><strong>Range:</strong> 2000–15000 ms.<br><strong>Lager:</strong> sneller resultaat, meer requests, kans op contextverlies.<br><strong>Hoger:</strong> minder requests, stabieler context, maar meer vertraging.</div>
+            </div>
+            <div class="form-group" style="flex:0 0 170px;">
+              <label>Max duur (min)</label>
+              <input type="text" value="${escAttr(String(maxDuration))}" onchange="updateConfig(${ai}, 'max_duration_minutes', this.value)">
+              <div class="help-text"><strong>Doel:</strong> veiligheidslimiet van een sessie.<br><strong>Range:</strong> 5–360 min.<br><strong>Lager:</strong> minder risico op runaway sessies.<br><strong>Hoger:</strong> langere vergaderingen mogelijk.</div>
+            </div>
+          </div>
+          <div class="inline-row">
+            <div class="form-group" style="flex:0 0 170px;">
+              <label>Chunk min (ms)</label>
+              <input type="text" value="${escAttr(String(chunkMinMs))}" onchange="updateConfig(${ai}, 'chunk_min_ms', this.value)">
+              <div class="help-text"><strong>Doel:</strong> minimale chunkduur vóór een knip mag plaatsvinden.<br><strong>Range:</strong> 1200–10000 ms.<br><strong>Lager:</strong> sneller reageren op korte pauzes; meer fragmentatie.<br><strong>Hoger:</strong> natuurlijkere zinnen; iets meer latency.</div>
+            </div>
+            <div class="form-group" style="flex:0 0 170px;">
+              <label>Chunk max (ms)</label>
+              <input type="text" value="${escAttr(String(chunkMaxMs))}" onchange="updateConfig(${ai}, 'chunk_max_ms', this.value)">
+              <div class="help-text"><strong>Doel:</strong> harde knip als er geen stilte valt.<br><strong>Range:</strong> min+800 tot 30000 ms.<br><strong>Lager:</strong> sneller updates; meer kans op midden-in-zin knip.<br><strong>Hoger:</strong> betere volledigheid bij snel spreken; tragere updates.</div>
+            </div>
+          </div>
+          <div class="inline-row">
+            <div class="form-group" style="flex:0 0 170px;">
+              <label>VAD stilte (ms)</label>
+              <input type="text" value="${escAttr(String(vadSilenceMs))}" onchange="updateConfig(${ai}, 'vad_silence_ms', this.value)">
+              <div class="help-text"><strong>Doel:</strong> hoe lang stilte moet duren voor knip.<br><strong>Range:</strong> 350–3000 ms.<br><strong>Lager:</strong> snelle knip na korte pauzes; risico op te vaak knippen.<br><strong>Hoger:</strong> stabielere zinsblokken; meer vertraging.</div>
+            </div>
+            <div class="form-group" style="flex:0 0 170px;">
+              <label>VAD drempel</label>
+              <input type="text" value="${escAttr(String(vadThreshold))}" onchange="updateConfig(${ai}, 'vad_threshold', this.value)">
+              <div class="help-text"><strong>Doel:</strong> compatibiliteitsdrempel voor VAD (oude sleutel).<br><strong>Range:</strong> 0.002–0.08 (unitless RMS).<br><strong>Lager:</strong> gevoeliger (pakt zachte spraak), meer ruisgevoelig.<br><strong>Hoger:</strong> minder ruis, maar kan zachte spraak missen.</div>
+            </div>
+            <div class="form-group" style="flex:0 0 170px;">
+              <label>Silence threshold (RMS, unitless)</label>
+              <input type="text" value="${escAttr(String(silenceThreshold))}" onchange="updateConfig(${ai}, 'silence_threshold', this.value)">
+              <div class="help-text">Eenheid: RMS-amplitude zonder unit (0–1). Praktisch bereik: 0.002–0.08. Lager = gevoeliger (sneller spraak), hoger = strenger (meer stilte nodig).</div>
+            </div>
+            <div class="form-group" style="flex:0 0 170px;">
+              <label>Overlap (ms)</label>
+              <input type="text" value="${escAttr(String(overlapMs))}" onchange="updateConfig(${ai}, 'overlap_ms', this.value)">
+              <div class="help-text"><strong>Doel:</strong> configuratie voor overlapstrategie in de client.<br><strong>Range:</strong> 0–2500 ms.<br><strong>Lager:</strong> minder duplicaatkans, maar minder contextbuffer.<br><strong>Hoger:</strong> potentieel betere continuïteit, maar ook meer overlap/duplicatie-risico.</div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Context prompt</label>
+            <input type="text" value="${escAttr(contextPrompt)}" onchange="updateConfig(${ai}, 'context_prompt', this.value)">
+            <div class="help-text"><strong>Doel:</strong> extra instructie/context die per chunk wordt meegestuurd.<br><strong>Advies:</strong> kort en taakgericht (taal, stijl, domeinwoorden).<br><strong>Te lang:</strong> meer promptruis en mogelijk minder stabiele output.</div>
+          </div>
+          <div class="inline-row" style="gap:1rem; align-items:flex-end;">
+            <label class="toggle-label" style="margin-bottom:0.25rem;">
+              <input type="checkbox" ${enableSpeakerLabels ? "checked" : ""} onchange="updateConfigBool(${ai}, 'enable_speaker_labels', this.checked)">
+              <span class="toggle-switch"></span>
+              <span class="toggle-text">Sprekerlabels aan</span>
+            </label>
+            <label class="toggle-label" style="margin-bottom:0.25rem;">
+              <input type="checkbox" ${includeTimestamps ? "checked" : ""} onchange="updateConfigBool(${ai}, 'include_timestamps', this.checked)">
+              <span class="toggle-switch"></span>
+              <span class="toggle-text">Timestamps tonen</span>
+            </label>
+          </div>
+          <div class="help-text" style="margin-top:0.25rem;"><strong>Sprekerlabels:</strong> momenteel niet gebruikt in de vereenvoudigde transcript-UI. Uit laten voor consistente output.<br><strong>Timestamps:</strong> aan = beter terugzoeken in transcript; uit = rustiger tekstbeeld.</div>
         </div>`;
     }
 
@@ -351,6 +458,24 @@ function updateTarget(ai, value) {
   if (value === "versimpelaar" && !data.apps[ai].config) {
     data.apps[ai].config = { language_levels: ["B1", "B2"], default_level: "B1" };
   }
+  if (value === "transcriptie" && !data.apps[ai].config) {
+    data.apps[ai].config = {
+      webhook_token: "",
+      chunk_ms: 5000,
+      chunk_min_ms: 2200,
+      chunk_max_ms: 12000,
+      vad_silence_ms: 900,
+      vad_threshold: 0.012,
+      silence_threshold: 0.012,
+      overlap_ms: 650,
+      context_prompt: "Nederlands gesprek, maak een complete en nette transcriptie.",
+      max_duration_minutes: 120,
+      litellm_model: "whisper",
+      language: "nl",
+      enable_speaker_labels: false,
+      include_timestamps: true,
+    };
+  }
   renderApps();
 }
 
@@ -358,9 +483,26 @@ function updateConfig(ai, key, value) {
   if (!data.apps[ai].config) data.apps[ai].config = {};
   if (key === "language_levels") {
     data.apps[ai].config[key] = value.split(",").map(s => s.trim()).filter(Boolean);
+  } else if (
+    key === "chunk_ms" ||
+    key === "chunk_min_ms" ||
+    key === "chunk_max_ms" ||
+    key === "vad_silence_ms" ||
+    key === "vad_threshold" ||
+    key === "silence_threshold" ||
+    key === "overlap_ms" ||
+    key === "max_duration_minutes"
+  ) {
+    const n = Number(value);
+    data.apps[ai].config[key] = Number.isFinite(n) ? n : value;
   } else {
     data.apps[ai].config[key] = value;
   }
+}
+
+function updateConfigBool(ai, key, value) {
+  if (!data.apps[ai].config) data.apps[ai].config = {};
+  data.apps[ai].config[key] = Boolean(value);
 }
 
 function addApp() {

@@ -2,8 +2,10 @@ const express = require("express");
 const cookieParser = require("cookie-parser");
 const crypto = require("crypto");
 const fs = require("fs");
+const http = require("http");
 const path = require("path");
 const sharp = require("sharp");
+const { WebSocket, WebSocketServer } = require("ws");
 
 const app = express();
 const PORT = process.env.PORT || 3002;
@@ -41,6 +43,19 @@ const CRAWLER_RUNS_LIMIT = Math.max(
   10,
   Number.parseInt(String(process.env.CRAWLER_RUNS_LIMIT || "200"), 10) || 200,
 );
+const REALTIME_STT_TOKEN = String(
+  process.env.REALTIME_STT_TOKEN || process.env.N8N_WEBHOOK_TOKEN || "",
+).trim();
+const REALTIME_STT_PROVIDER_DEFAULT = String(process.env.REALTIME_STT_PROVIDER || "litellm").trim().toLowerCase() || "litellm";
+const LITELLM_REALTIME_URL = String(
+  process.env.LITELLM_REALTIME_URL || `${String(process.env.LITELLM_URL || "http://litellm:4000").replace(/\/$/, "")}/v1/realtime`,
+).trim();
+const LITELLM_REALTIME_MODEL_DEFAULT = String(process.env.LITELLM_REALTIME_MODEL || "gpt-4o-realtime-preview").trim();
+const LITELLM_REALTIME_API_KEY = String(process.env.LITELLM_REALTIME_API_KEY || process.env.LITELLM_API_KEY || "").trim();
+const AZURE_OPENAI_REALTIME_API_BASE = String(process.env.AZURE_OPENAI_REALTIME_API_BASE || "").trim();
+const AZURE_OPENAI_REALTIME_API_VERSION = String(process.env.AZURE_OPENAI_REALTIME_API_VERSION || "").trim();
+const AZURE_OPENAI_REALTIME_API_KEY = String(process.env.AZURE_OPENAI_REALTIME_API_KEY || "").trim();
+const AZURE_OPENAI_REALTIME_MODEL = String(process.env.AZURE_OPENAI_REALTIME_MODEL || "").trim();
 const ORCHESTRATOR_IMAGE_DATA_URL_MAX_CHARS_DEFAULT = Math.max(
   50000,
   Number.parseInt(String(process.env.N8N_ORCHESTRATOR_IMAGE_DATA_URL_MAX_CHARS || "450000"), 10) || 450000,
@@ -49,12 +64,191 @@ const ORCHESTRATOR_IMAGE_MAX_RESOLUTION_PX_DEFAULT = Math.max(
   512,
   Number.parseInt(String(process.env.N8N_ORCHESTRATOR_IMAGE_MAX_RESOLUTION_PX || "1568"), 10) || 1568,
 );
+const LIBRECHAT_INTERNAL_URL = String(process.env.LIBRECHAT_INTERNAL_URL || "http://librechat:3080").trim();
+const TRANSCRIPT_SESSIONS_FILE = "transcript-sessions.json";
+const TRANSCRIPT_AUTH_DEBUG = String(process.env.TRANSCRIPT_AUTH_DEBUG || "false").toLowerCase() === "true";
+const LIBRECHAT_JWT_REFRESH_SECRET = String(process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET || "").trim();
 
 // Active sessions (in-memory, resets on restart)
 const sessions = new Map();
 const imageJobs = new Map();
 const imageJobQueue = [];
 let imageWorkersActive = 0;
+const realtimeWss = new WebSocketServer({ noServer: true });
+
+function sendWs(ws, payload) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  try {
+    ws.send(JSON.stringify(payload));
+  } catch {
+    // no-op
+  }
+}
+
+function parseJsonMaybe(raw) {
+  try {
+    return JSON.parse(String(raw || ""));
+  } catch {
+    return null;
+  }
+}
+
+function withQuery(urlString, key, value) {
+  const out = new URL(urlString);
+  if (value !== undefined && value !== null && String(value).trim()) {
+    out.searchParams.set(key, String(value).trim());
+  }
+  return out;
+}
+
+function toWebSocketUrl(rawUrl) {
+  const parsed = new URL(rawUrl);
+  if (parsed.protocol === "http:") parsed.protocol = "ws:";
+  if (parsed.protocol === "https:") parsed.protocol = "wss:";
+  return parsed.toString();
+}
+
+function decodeBase64Url(input) {
+  const raw = String(input || "").replace(/-/g, "+").replace(/_/g, "/");
+  const padLen = (4 - (raw.length % 4)) % 4;
+  const padded = raw + "=".repeat(padLen);
+  return Buffer.from(padded, "base64").toString("utf-8");
+}
+
+function verifyJwtHs256(token, secret) {
+  try {
+    if (!token || !secret) return null;
+    const parts = String(token).split(".");
+    if (parts.length !== 3) return null;
+    const [headerB64, payloadB64, sigB64] = parts;
+    const signingInput = `${headerB64}.${payloadB64}`;
+
+    const expectedSig = crypto
+      .createHmac("sha256", secret)
+      .update(signingInput)
+      .digest("base64")
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/g, "");
+
+    const sigA = Buffer.from(String(sigB64 || ""));
+    const sigB = Buffer.from(String(expectedSig || ""));
+    if (sigA.length !== sigB.length || !crypto.timingSafeEqual(sigA, sigB)) return null;
+
+    const header = JSON.parse(decodeBase64Url(headerB64));
+    if (String(header?.alg || "").toUpperCase() !== "HS256") return null;
+
+    const payload = JSON.parse(decodeBase64Url(payloadB64));
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (Number.isFinite(Number(payload?.exp)) && Number(payload.exp) < nowSec) return null;
+    if (Number.isFinite(Number(payload?.nbf)) && Number(payload.nbf) > nowSec) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function resolveUserFromVerifiedRefreshToken(req) {
+  const token = String(req.cookies?.refreshToken || "").trim();
+  if (!token || !LIBRECHAT_JWT_REFRESH_SECRET) return null;
+
+  const payload = verifyJwtHs256(token, LIBRECHAT_JWT_REFRESH_SECRET);
+  if (!payload || typeof payload !== "object") return null;
+
+  const id = String(payload.id || payload.userId || payload.sub || "").trim();
+  if (!id) return null;
+
+  return {
+    id,
+    email: undefined,
+    username: undefined,
+    label: id,
+    source: "refreshToken",
+  };
+}
+
+function resolveRealtimeTarget({ provider, model, language }) {
+  const selectedProvider = String(provider || REALTIME_STT_PROVIDER_DEFAULT || "litellm").trim().toLowerCase();
+
+  if (selectedProvider === "azure" || selectedProvider === "azure_direct") {
+    if (!AZURE_OPENAI_REALTIME_API_BASE) {
+      throw new Error("AZURE_OPENAI_REALTIME_API_BASE ontbreekt");
+    }
+    if (!AZURE_OPENAI_REALTIME_API_KEY) {
+      throw new Error("AZURE_OPENAI_REALTIME_API_KEY ontbreekt");
+    }
+
+    const effectiveModel = String(model || AZURE_OPENAI_REALTIME_MODEL || "").trim();
+    if (!effectiveModel) {
+      throw new Error("Realtime model ontbreekt voor Azure");
+    }
+
+    const realtimeBase = toWebSocketUrl(AZURE_OPENAI_REALTIME_API_BASE);
+    let targetUrl = withQuery(realtimeBase, "model", effectiveModel);
+    if (AZURE_OPENAI_REALTIME_API_VERSION) {
+      targetUrl = withQuery(targetUrl.toString(), "api-version", AZURE_OPENAI_REALTIME_API_VERSION);
+    }
+
+    return {
+      provider: "azure_direct",
+      model: effectiveModel,
+      language: String(language || "").trim() || undefined,
+      url: targetUrl.toString(),
+      headers: {
+        "api-key": AZURE_OPENAI_REALTIME_API_KEY,
+      },
+    };
+  }
+
+  if (!LITELLM_REALTIME_API_KEY) {
+    throw new Error("LITELLM_REALTIME_API_KEY/LITELLM_API_KEY ontbreekt");
+  }
+
+  const effectiveModel = String(model || LITELLM_REALTIME_MODEL_DEFAULT || "").trim();
+  if (!effectiveModel) {
+    throw new Error("Realtime model ontbreekt voor LiteLLM");
+  }
+
+  const realtimeBase = toWebSocketUrl(LITELLM_REALTIME_URL);
+  const targetUrl = withQuery(realtimeBase, "model", effectiveModel);
+
+  return {
+    provider: "litellm",
+    model: effectiveModel,
+    language: String(language || "").trim() || undefined,
+    url: targetUrl.toString(),
+    headers: {
+      Authorization: `Bearer ${LITELLM_REALTIME_API_KEY}`,
+    },
+  };
+}
+
+function extractTranscriptFromRealtimeEvent(evt) {
+  if (!evt || typeof evt !== "object") return null;
+
+  if (evt.type === "response.audio_transcript.delta") {
+    const t = String(evt.delta || "");
+    return t ? { kind: "delta", text: t } : null;
+  }
+  if (evt.type === "response.audio_transcript.done") {
+    const t = String(evt.transcript || "").trim();
+    return t ? { kind: "final", text: t } : null;
+  }
+  if (evt.type === "conversation.item.input_audio_transcription.completed") {
+    const t = String(evt.transcript || evt.text || "").trim();
+    return t ? { kind: "final", text: t } : null;
+  }
+  if (evt.type === "response.output_text.delta") {
+    const t = String(evt.delta || "");
+    return t ? { kind: "delta", text: t } : null;
+  }
+  if (evt.type === "response.output_text.done") {
+    const t = String(evt.text || "").trim();
+    return t ? { kind: "final", text: t } : null;
+  }
+
+  return null;
+}
 
 // ── Middleware ──────────────────────────────────────────────────────
 app.use(express.json({ limit: "20mb" }));
@@ -76,6 +270,23 @@ app.use("/api/image-jobs", (req, res, next) => {
   res.set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-govchat-token");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
+});
+
+app.use("/api/transcript-sessions", (req, res, next) => {
+  res.set("Access-Control-Allow-Origin", CORS_ORIGIN);
+  res.set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+app.get("/api/realtime-stt", (req, res) => {
+  return res.json({
+    ok: true,
+    transport: "websocket",
+    ws_path: "/api/realtime-stt",
+    provider_default: REALTIME_STT_PROVIDER_DEFAULT,
+  });
 });
 
 // ── Data helpers ───────────────────────────────────────────────────
@@ -131,6 +342,22 @@ function readJSON(filename) {
   const filepath = path.join(DATA_DIR, filename);
   if (!fs.existsSync(filepath)) return null;
   return JSON.parse(fs.readFileSync(filepath, "utf-8"));
+}
+
+function readPrivateJSON(filename) {
+  const filepath = path.join(DATA_DIR, filename);
+  if (!fs.existsSync(filepath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(filepath, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+
+function writePrivateJSON(filename, data) {
+  ensureDataDir();
+  const filepath = path.join(DATA_DIR, filename);
+  fs.writeFileSync(filepath, JSON.stringify(data, null, 2), "utf-8");
 }
 
 function writeJSON(filename, data) {
@@ -860,6 +1087,327 @@ function extractToken(req) {
   return String(req.headers["x-govchat-token"] || "").trim();
 }
 
+function normalizeTranscriptSessionInput(input = {}, fallbackId = "") {
+  const text = String(input.text || "").trim();
+  const segments = Array.isArray(input.segments) ? input.segments : [];
+  const now = Date.now();
+  const rawId = String(input.id || fallbackId || `trs-${now}-${crypto.randomBytes(4).toString("hex")}`).trim();
+  const id = rawId || `trs-${now}-${crypto.randomBytes(4).toString("hex")}`;
+  const createdAt = Number(input.createdAt || now);
+  const updatedAt = Number(input.updatedAt || now);
+  const durationMs = Math.max(0, Number(input.durationMs || 0));
+  const wordCount = Math.max(0, Number(input.wordCount || 0));
+  const title = String(input.title || "").trim() || "Transcriptie sessie";
+  const inputSource = String(input.inputSource || "").trim() || "Onbekend";
+  const inputDevice = String(input.inputDevice || "").trim() || "Onbekend";
+  const language = String(input.language || "").trim() || "nl";
+  return {
+    id,
+    title,
+    createdAt: Number.isFinite(createdAt) ? createdAt : now,
+    updatedAt: Number.isFinite(updatedAt) ? updatedAt : now,
+    durationMs,
+    inputSource,
+    inputDevice,
+    wordCount,
+    language,
+    text,
+    segments,
+  };
+}
+
+function readTranscriptSessionsStore() {
+  const raw = readPrivateJSON(TRANSCRIPT_SESSIONS_FILE);
+  if (!raw || typeof raw !== "object") return { users: {} };
+  if (!raw.users || typeof raw.users !== "object") return { users: {} };
+  return raw;
+}
+
+function writeTranscriptSessionsStore(store) {
+  const normalized = store && typeof store === "object" ? store : { users: {} };
+  if (!normalized.users || typeof normalized.users !== "object") {
+    normalized.users = {};
+  }
+  writePrivateJSON(TRANSCRIPT_SESSIONS_FILE, normalized);
+}
+
+function sortTranscriptSessions(items, sort = "newest") {
+  const arr = [...(Array.isArray(items) ? items : [])];
+  const mode = String(sort || "newest").trim().toLowerCase();
+  if (mode === "oldest") {
+    return arr.sort((a, b) => Number(a.createdAt || 0) - Number(b.createdAt || 0));
+  }
+  if (mode === "updated") {
+    return arr.sort((a, b) => Number(b.updatedAt || b.createdAt || 0) - Number(a.updatedAt || a.createdAt || 0));
+  }
+  if (mode === "duration") {
+    return arr.sort((a, b) => Number(b.durationMs || 0) - Number(a.durationMs || 0));
+  }
+  if (mode === "words") {
+    return arr.sort((a, b) => Number(b.wordCount || 0) - Number(a.wordCount || 0));
+  }
+  if (mode === "title") {
+    return arr.sort((a, b) => String(a.title || "").localeCompare(String(b.title || ""), "nl"));
+  }
+  return arr.sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
+}
+
+async function resolveLibreChatUserFromRequest(req) {
+  const trustedUser = resolveUserFromVerifiedRefreshToken(req);
+  if (trustedUser) return trustedUser;
+
+  const debugAttempts = [];
+  const inboundHeadersSnapshot = TRANSCRIPT_AUTH_DEBUG
+    ? {
+        host: String(req.headers?.host || ""),
+        origin: String(req.headers?.origin || ""),
+        referer: String(req.headers?.referer || ""),
+        "user-agent": String(req.headers?.["user-agent"] || ""),
+        "x-forwarded-for": String(req.headers?.["x-forwarded-for"] || ""),
+        "x-forwarded-proto": String(req.headers?.["x-forwarded-proto"] || ""),
+        "x-real-ip": String(req.headers?.["x-real-ip"] || ""),
+      }
+    : null;
+  const pushDebug = (entry) => {
+    if (!TRANSCRIPT_AUTH_DEBUG) return;
+    debugAttempts.push(entry);
+  };
+  const flushDebug = (reason = "") => {
+    if (!TRANSCRIPT_AUTH_DEBUG) return;
+    try {
+      console.warn(
+        `[transcript-auth] resolve failed (${reason})`,
+        JSON.stringify(
+          {
+            path: String(req.originalUrl || req.url || ""),
+            hasCookieHeader: Boolean(String(req.headers?.cookie || "").trim()),
+            hasAuthorizationHeader: Boolean(String(req.headers?.authorization || "").trim()),
+            inboundHeaders: inboundHeadersSnapshot,
+            inboundCookieNames,
+            tokenCookieHits,
+            bearerVariantsCount: bearerSet.size,
+            attempts: debugAttempts,
+          },
+          null,
+          2,
+        ),
+      );
+    } catch {
+      // ignore logging errors
+    }
+  };
+
+  const authHeaderRaw = String(req.headers?.authorization || "").trim();
+  let cookieHeader = String(req.headers?.cookie || "").trim();
+  if (!cookieHeader && !authHeaderRaw) return null;
+
+  const parseCookieMap = (rawCookie = "") => {
+    const out = {};
+    String(rawCookie || "")
+      .split(";")
+      .map((p) => p.trim())
+      .filter(Boolean)
+      .forEach((part) => {
+        const idx = part.indexOf("=");
+        if (idx <= 0) return;
+        const key = part.slice(0, idx).trim();
+        const val = part.slice(idx + 1).trim();
+        if (!key) return;
+        try {
+          out[key] = decodeURIComponent(val);
+        } catch {
+          out[key] = val;
+        }
+      });
+    return out;
+  };
+
+  const cookieMap = parseCookieMap(cookieHeader);
+  const inboundCookieNames = Object.keys(cookieMap);
+  const rebuildCookieHeader = () => {
+    cookieHeader = Object.entries(cookieMap)
+      .map(([k, v]) => `${k}=${String(v)}`)
+      .join("; ");
+  };
+
+  const applySetCookieHeaders = (headersLike) => {
+    if (!headersLike) return;
+    let setCookies = [];
+    if (typeof headersLike.getSetCookie === "function") {
+      setCookies = headersLike.getSetCookie();
+    } else {
+      const raw = headersLike.get?.("set-cookie");
+      if (raw) {
+        setCookies = String(raw)
+          .split(/,(?=[^;,=\s]+=[^;,]+)/g)
+          .map((v) => v.trim())
+          .filter(Boolean);
+      }
+    }
+    if (!Array.isArray(setCookies) || !setCookies.length) return;
+    for (const line of setCookies) {
+      const kv = String(line || "")
+        .split(";")[0]
+        .trim();
+      const idx = kv.indexOf("=");
+      if (idx <= 0) continue;
+      const key = kv.slice(0, idx).trim();
+      const val = kv.slice(idx + 1).trim();
+      if (!key) continue;
+      cookieMap[key] = val;
+    }
+    rebuildCookieHeader();
+  };
+  const candidateTokenKeys = [
+    "token",
+    "accessToken",
+    "access_token",
+    "jwt",
+    "jwtToken",
+    "authToken",
+    "authorization",
+  ];
+
+  const bearerSet = new Set();
+  if (authHeaderRaw) {
+    const direct = authHeaderRaw.toLowerCase().startsWith("bearer ")
+      ? authHeaderRaw.slice(7).trim()
+      : authHeaderRaw;
+    if (direct) bearerSet.add(`Bearer ${direct}`);
+  }
+  for (const key of candidateTokenKeys) {
+    const val = String(cookieMap[key] || "").trim();
+    if (!val) continue;
+    if (val.toLowerCase().startsWith("bearer ")) {
+      const token = val.slice(7).trim();
+      if (token) bearerSet.add(`Bearer ${token}`);
+      continue;
+    }
+    if (val.includes(".")) {
+      bearerSet.add(`Bearer ${val}`);
+    }
+  }
+  const tokenCookieHits = candidateTokenKeys.filter((k) => String(cookieMap[k] || "").trim());
+
+  const extractUser = (payload) => {
+    if (!payload || typeof payload !== "object") return null;
+    const candidateUsers = [
+      payload.user,
+      payload.data?.user,
+      payload.data,
+      payload.profile,
+      payload,
+    ];
+    for (const user of candidateUsers) {
+      if (!user || typeof user !== "object") continue;
+      const id = String(user.id || user._id || user.userId || user.sub || "").trim();
+      const email = String(user.email || "").trim();
+      const username = String(user.username || user.name || "").trim();
+      const key = id || email || username;
+      if (!key) continue;
+      return {
+        id: key,
+        email: email || undefined,
+        username: username || undefined,
+        label: email || username || key,
+      };
+    }
+    return null;
+  };
+
+  const extractAccessToken = (payload) => {
+    if (!payload || typeof payload !== "object") return "";
+    const token = String(
+      payload.token ||
+        payload.accessToken ||
+        payload.access_token ||
+        payload.jwt ||
+        payload.authToken ||
+        payload.data?.token ||
+        payload.data?.accessToken ||
+        payload.data?.access_token ||
+        payload.data?.jwt ||
+        "",
+    ).trim();
+    return token;
+  };
+
+  const requestWithAuthVariants = async ({ endpoint, method = "GET", body = undefined }) => {
+    const authVariants = ["", ...bearerSet];
+    for (const authHeader of authVariants) {
+      try {
+        const headers = {
+          accept: "application/json",
+          "user-agent": String(req.headers?.["user-agent"] || "govchat-overlay-admin/1.0"),
+          "x-forwarded-for": String(req.headers?.["x-forwarded-for"] || ""),
+          "x-forwarded-proto": String(req.headers?.["x-forwarded-proto"] || ""),
+          "x-real-ip": String(req.headers?.["x-real-ip"] || ""),
+          "x-requested-with": "govchat-overlay-admin",
+        };
+        if (cookieHeader) headers.cookie = cookieHeader;
+        if (authHeader) headers.authorization = authHeader;
+        if (body !== undefined) headers["content-type"] = "application/json";
+
+        const res = await fetch(`${LIBRECHAT_INTERNAL_URL}${endpoint}`, {
+          method,
+          headers,
+          body: body !== undefined ? JSON.stringify(body) : undefined,
+        });
+        pushDebug({
+          endpoint,
+          method,
+          status: Number(res.status || 0),
+          usedAuthHeader: Boolean(authHeader),
+          hadCookieHeader: Boolean(cookieHeader),
+          outboundHeaderKeys: Object.keys(headers),
+        });
+        applySetCookieHeaders(res.headers);
+        if (!res.ok) continue;
+        const payload = await res.json().catch(() => null);
+        if (!payload) {
+          pushDebug({ endpoint, method, status: Number(res.status || 0), note: "empty-json" });
+        }
+        if (!payload || typeof payload !== "object") continue;
+
+        const token = extractAccessToken(payload);
+        if (token) bearerSet.add(`Bearer ${token}`);
+
+        const user = extractUser(payload);
+        if (user) return user;
+      } catch {
+        // try next variant/endpoint
+      }
+    }
+    return null;
+  };
+
+  const candidates = ["/api/user", "/api/auth/me", "/api/me"];
+
+  for (const endpoint of candidates) {
+    const user = await requestWithAuthVariants({ endpoint, method: "GET" });
+    if (user) return user;
+  }
+
+  // Fallback for deployments where user resolution requires refresh-token exchange first.
+  await requestWithAuthVariants({ endpoint: "/api/auth/refresh", method: "POST", body: {} });
+  for (const endpoint of candidates) {
+    const user = await requestWithAuthVariants({ endpoint, method: "GET" });
+    if (user) return user;
+  }
+
+  flushDebug("no-user-from-endpoints");
+  return null;
+}
+
+async function requireLibreChatUser(req, res, next) {
+  const user = await resolveLibreChatUserFromRequest(req);
+  if (!user) {
+    return res.status(401).json({ error: "Niet ingelogd of gebruiker niet resolvebaar" });
+  }
+  req.librechatUser = user;
+  next();
+}
+
 function requireImageJobsAuth(req, res, next) {
   if (!IMAGE_JOBS_ENABLED) {
     return res.status(404).json({ error: "Image jobs endpoint staat uit" });
@@ -1395,6 +1943,97 @@ app.post("/api/config/apps", requireAuth, (req, res) => {
   }
 });
 
+app.get("/api/transcript-sessions", requireLibreChatUser, (req, res) => {
+  const userId = String(req.librechatUser?.id || "").trim();
+  if (!userId) return res.status(401).json({ error: "Gebruiker niet gevonden" });
+  const sort = String(req.query.sort || "newest").trim().toLowerCase();
+  const store = readTranscriptSessionsStore();
+  const sessionsForUser = Array.isArray(store.users?.[userId]) ? store.users[userId] : [];
+  return res.json({
+    ok: true,
+    user: req.librechatUser,
+    sessions: sortTranscriptSessions(sessionsForUser, sort),
+  });
+});
+
+app.post("/api/transcript-sessions", requireLibreChatUser, (req, res) => {
+  const userId = String(req.librechatUser?.id || "").trim();
+  if (!userId) return res.status(401).json({ error: "Gebruiker niet gevonden" });
+  const incoming = normalizeTranscriptSessionInput(req.body || {});
+  const store = readTranscriptSessionsStore();
+  if (!Array.isArray(store.users[userId])) store.users[userId] = [];
+  const list = store.users[userId];
+  const existingIndex = list.findIndex((s) => String(s.id || "") === String(incoming.id || ""));
+  if (existingIndex >= 0) {
+    list[existingIndex] = {
+      ...list[existingIndex],
+      ...incoming,
+      updatedAt: Date.now(),
+    };
+  } else {
+    list.unshift(incoming);
+  }
+  store.users[userId] = sortTranscriptSessions(list, "newest").slice(0, 500);
+  writeTranscriptSessionsStore(store);
+  return res.json({ ok: true, session: incoming });
+});
+
+app.patch("/api/transcript-sessions/:sessionId", requireLibreChatUser, (req, res) => {
+  const userId = String(req.librechatUser?.id || "").trim();
+  if (!userId) return res.status(401).json({ error: "Gebruiker niet gevonden" });
+  const sessionId = String(req.params.sessionId || "").trim();
+  if (!sessionId) return res.status(400).json({ error: "sessionId ontbreekt" });
+
+  const store = readTranscriptSessionsStore();
+  if (!Array.isArray(store.users[userId])) store.users[userId] = [];
+  const idx = store.users[userId].findIndex((s) => String(s.id || "") === sessionId);
+  if (idx < 0) return res.status(404).json({ error: "Sessie niet gevonden" });
+
+  const current = store.users[userId][idx] || {};
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const hasTitlePatch = Object.prototype.hasOwnProperty.call(body, "title");
+  const nextTitle = hasTitlePatch ? String(body.title || "").trim() : String(current.title || "").trim();
+  if (hasTitlePatch && !nextTitle) return res.status(400).json({ error: "Titel mag niet leeg zijn" });
+
+  const rawCreatedAt = Number(body.createdAt);
+  const rawDurationMs = Number(body.durationMs);
+  const rawWordCount = Number(body.wordCount);
+  const rawUpdatedAt = Number(body.updatedAt);
+
+  store.users[userId][idx] = {
+    ...current,
+    title: nextTitle,
+    createdAt: Number.isFinite(rawCreatedAt) ? rawCreatedAt : Number(current.createdAt || Date.now()),
+    durationMs: Number.isFinite(rawDurationMs) ? Math.max(0, rawDurationMs) : Math.max(0, Number(current.durationMs || 0)),
+    inputSource: String(body.inputSource || "").trim() || String(current.inputSource || "Onbekend"),
+    inputDevice: String(body.inputDevice || "").trim() || String(current.inputDevice || "Onbekend"),
+    wordCount: Number.isFinite(rawWordCount) ? Math.max(0, rawWordCount) : Math.max(0, Number(current.wordCount || 0)),
+    language: String(body.language || "").trim() || String(current.language || "nl"),
+    text: typeof body.text === "string" ? body.text : String(current.text || ""),
+    segments: Array.isArray(body.segments) ? body.segments : Array.isArray(current.segments) ? current.segments : [],
+    updatedAt: Number.isFinite(rawUpdatedAt) ? rawUpdatedAt : Date.now(),
+  };
+  writeTranscriptSessionsStore(store);
+  return res.json({ ok: true, session: store.users[userId][idx] });
+});
+
+app.delete("/api/transcript-sessions/:sessionId", requireLibreChatUser, (req, res) => {
+  const userId = String(req.librechatUser?.id || "").trim();
+  if (!userId) return res.status(401).json({ error: "Gebruiker niet gevonden" });
+  const sessionId = String(req.params.sessionId || "").trim();
+  if (!sessionId) return res.status(400).json({ error: "sessionId ontbreekt" });
+
+  const store = readTranscriptSessionsStore();
+  if (!Array.isArray(store.users[userId])) store.users[userId] = [];
+  const before = store.users[userId].length;
+  store.users[userId] = store.users[userId].filter((s) => String(s.id || "") !== sessionId);
+  if (store.users[userId].length === before) {
+    return res.status(404).json({ error: "Sessie niet gevonden" });
+  }
+  writeTranscriptSessionsStore(store);
+  return res.json({ ok: true, removed: sessionId });
+});
+
 app.get("/api/crawler/config", requireAuth, (req, res) => {
   res.json(readCrawlerConfig());
 });
@@ -1511,6 +2150,189 @@ app.post("/api/crawler/run/:runId/cancel", requireAuth, (req, res) => {
   return res.json({ ok: true, run: result.run });
 });
 
+realtimeWss.on("connection", (clientWs, req) => {
+  const reqUrl = new URL(req.url || "/api/realtime-stt", "http://localhost");
+  const suppliedToken = String(
+    reqUrl.searchParams.get("token") || req.headers["x-govchat-token"] || req.headers.authorization || "",
+  )
+    .replace(/^Bearer\s+/i, "")
+    .trim();
+  if (REALTIME_STT_TOKEN && suppliedToken !== REALTIME_STT_TOKEN) {
+    sendWs(clientWs, { type: "error", error: "Unauthorized" });
+    clientWs.close(4401, "Unauthorized");
+    return;
+  }
+
+  let upstreamWs = null;
+  let upstreamReady = false;
+  let streamStartedAt = Date.now();
+  let requestedLanguage = "";
+
+  function closeUpstream() {
+    if (upstreamWs) {
+      try {
+        upstreamWs.close();
+      } catch {
+        // no-op
+      }
+    }
+    upstreamWs = null;
+    upstreamReady = false;
+  }
+
+  function ensureUpstream(startPayload = {}) {
+    if (upstreamWs) return;
+    let target;
+    try {
+      target = resolveRealtimeTarget({
+        provider: startPayload.provider || reqUrl.searchParams.get("provider") || undefined,
+        model: startPayload.model || reqUrl.searchParams.get("model") || undefined,
+        language: startPayload.language || reqUrl.searchParams.get("language") || undefined,
+      });
+    } catch (err) {
+      sendWs(clientWs, { type: "error", error: String(err?.message || err) });
+      return;
+    }
+
+    requestedLanguage = String(target.language || "").trim();
+    streamStartedAt = Date.now();
+
+    upstreamWs = new WebSocket(target.url, { headers: target.headers });
+
+    upstreamWs.on("open", () => {
+      upstreamReady = true;
+      sendWs(clientWs, {
+        type: "ready",
+        provider: target.provider,
+        model: target.model,
+        language: requestedLanguage || null,
+      });
+
+      const sessionUpdate = {
+        type: "session.update",
+        session: {
+          input_audio_format: "pcm16",
+          turn_detection: { type: "none" },
+        },
+      };
+      if (requestedLanguage) {
+        sessionUpdate.session.input_audio_transcription = {
+          model: target.model,
+          language: requestedLanguage,
+        };
+      } else {
+        sessionUpdate.session.input_audio_transcription = {
+          model: target.model,
+        };
+      }
+      sendWs(upstreamWs, sessionUpdate);
+    });
+
+    upstreamWs.on("message", (raw) => {
+      const evt = parseJsonMaybe(raw);
+      if (!evt) return;
+
+      const transcript = extractTranscriptFromRealtimeEvent(evt);
+      if (transcript?.kind === "delta") {
+        sendWs(clientWs, { type: "transcript.delta", text: transcript.text });
+        return;
+      }
+      if (transcript?.kind === "final") {
+        const sec = Math.max(0, (Date.now() - streamStartedAt) / 1000);
+        sendWs(clientWs, {
+          type: "transcript.final",
+          segment: {
+            id: crypto.randomUUID(),
+            start: Math.max(0, sec - 1),
+            end: sec,
+            speaker: "spreker-1",
+            text: transcript.text,
+          },
+        });
+        return;
+      }
+
+      if (evt.type === "error") {
+        sendWs(clientWs, {
+          type: "error",
+          error: String(evt.error?.message || evt.message || "Realtime upstream fout"),
+          upstream: evt,
+        });
+      }
+    });
+
+    upstreamWs.on("close", (code, reason) => {
+      upstreamReady = false;
+      sendWs(clientWs, {
+        type: "upstream.closed",
+        code,
+        reason: String(reason || ""),
+      });
+    });
+
+    upstreamWs.on("error", (err) => {
+      sendWs(clientWs, { type: "error", error: String(err?.message || err || "Upstream websocket fout") });
+    });
+  }
+
+  clientWs.on("message", (raw) => {
+    const msg = parseJsonMaybe(raw);
+    if (!msg || typeof msg !== "object") return;
+    const type = String(msg.type || "").trim();
+
+    if (type === "start") {
+      ensureUpstream(msg);
+      return;
+    }
+
+    if (type === "audio.append") {
+      ensureUpstream(msg);
+      if (upstreamWs && upstreamReady) {
+        sendWs(upstreamWs, {
+          type: "input_audio_buffer.append",
+          audio: String(msg.audio || ""),
+        });
+      }
+      return;
+    }
+
+    if (type === "audio.commit") {
+      if (upstreamWs && upstreamReady) {
+        sendWs(upstreamWs, { type: "input_audio_buffer.commit" });
+        sendWs(upstreamWs, {
+          type: "response.create",
+          response: { modalities: ["text"] },
+        });
+      }
+      return;
+    }
+
+    if (type === "stop") {
+      if (upstreamWs && upstreamReady) {
+        sendWs(upstreamWs, { type: "input_audio_buffer.commit" });
+        sendWs(upstreamWs, {
+          type: "response.create",
+          response: { modalities: ["text"] },
+        });
+      }
+      setTimeout(closeUpstream, 200);
+      return;
+    }
+
+    if (upstreamWs && upstreamReady && type) {
+      sendWs(upstreamWs, msg);
+    }
+  });
+
+  clientWs.on("close", () => {
+    closeUpstream();
+  });
+
+  clientWs.on("error", () => {
+    closeUpstream();
+  });
+});
+
 // ── Start ──────────────────────────────────────────────────────────
 initDefaults();
 loadPersistedImageJobs();
@@ -1523,7 +2345,28 @@ setTimeout(() => {
   console.log(`[govchat-admin] Published config to ${PUBLISH_DIR}`);
 }, 15000);
 
-app.listen(PORT, "0.0.0.0", () => {
+const server = http.createServer(app);
+
+server.on("upgrade", (req, socket, head) => {
+  let pathname = "";
+  try {
+    const parsed = new URL(req.url || "", `http://${req.headers.host || "localhost"}`);
+    pathname = parsed.pathname;
+  } catch {
+    pathname = "";
+  }
+
+  if (pathname !== "/api/realtime-stt") {
+    socket.destroy();
+    return;
+  }
+
+  realtimeWss.handleUpgrade(req, socket, head, (ws) => {
+    realtimeWss.emit("connection", ws, req);
+  });
+});
+
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`[govchat-admin] Running on http://0.0.0.0:${PORT}`);
   console.log(`[govchat-admin] Data directory: ${DATA_DIR}`);
   console.log(`[govchat-admin] Publish directory: ${PUBLISH_DIR}`);
@@ -1534,5 +2377,8 @@ app.listen(PORT, "0.0.0.0", () => {
   }
   console.log(
     `[govchat-admin] Crawler webhook: ${CRAWLER_N8N_WEBHOOK_URL} (internal token configured=${Boolean(CRAWLER_INTERNAL_TOKEN)})`,
+  );
+  console.log(
+    `[govchat-admin] Realtime STT bridge: /api/realtime-stt (provider=${REALTIME_STT_PROVIDER_DEFAULT})`,
   );
 });
