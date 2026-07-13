@@ -61,6 +61,7 @@
     <a href="/apps-editor">Apps</a>
     <a href="/crawler-editor">Crawler</a>
     <a href="/orchestrator-editor">Orchestrator</a>
+    <a href="/beleidskompas-editor">Beleidskompas</a>
     <a href="/logout">Uitloggen</a>
   </div>
 </nav>
@@ -108,6 +109,20 @@
       <p>Beheer allowlist-bronnen, robots.txt-respect, interval en start handmatige crawl-runs.</p>
       <div class="stat"><span class="stat-dot"></span> {{crawlerEnabled}} &middot; {{crawlerSources}} actieve bronnen</div>
       <a href="/crawler-editor" class="btn">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m16.862 4.487 1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L10.582 16.07a4.5 4.5 0 0 1-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 0 1 1.13-1.897l8.932-8.931Z"/></svg>
+        Beheren
+      </a>
+    </div>
+    <div class="card">
+      <div class="card-icon">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M12 3.75 21 8.25l-9 4.5-9-4.5 9-4.5Zm0 8.25 9-4.5M12 12l-9-4.5m0 4.5 9 4.5 9-4.5m-18 4.5 9 4.5 9-4.5"/>
+        </svg>
+      </div>
+      <h3>Beleidskompas</h3>
+      <p>Beheer Flow Builder, documentenbibliotheek, versiehistorie, instellingen, import/export en live publicatie.</p>
+      <div class="stat"><span class="stat-dot"></span> {{beleidskompasStepCount}} stappen &middot; {{beleidskompasVersionCount}} versies &middot; {{beleidskompasDocCount}} documenten</div>
+      <a href="/beleidskompas-editor" class="btn">
         <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m16.862 4.487 1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L10.582 16.07a4.5 4.5 0 0 1-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 0 1 1.13-1.897l8.932-8.931Z"/></svg>
         Beheren
       </a>

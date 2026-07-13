@@ -1,5 +1,16 @@
 # GovChat-NL Overlay voor Open WebUI
 
+> [!WARNING]
+> **Status: niet productierijp / niet gegarandeerd werkend.**
+> Deze repository wordt gedeeld als **inspiratie en referentie-implementatie** voor leveranciers en mede-overheden.
+> Gebruik dit niet als kant-en-klare productieoplossing zonder eigen validatie, security review, hardening en acceptatietesten.
+
+## Doel van publicatie
+
+- Inspiratie bieden voor leveranciersselectie en doorontwikkeling binnen overheidscontext.
+- Transparant delen van architectuurkeuzes en implementatie-ideeën.
+- Niet bedoeld als “direct deploybaar” standaardproduct.
+
 Een configureerbare overlay die **help-button**, **app launcher** en **admin panel** toevoegt aan een standaard [Open WebUI](https://github.com/open-webui/open-webui) deployment — zonder fork, zonder codewijzigingen.
 
 Ontwikkeld als onderdeel van [GovChat-NL](https://govchat-nl.nl), het open-source AI-chatplatform voor de Nederlandse overheid.

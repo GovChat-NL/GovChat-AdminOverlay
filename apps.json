@@ -22,6 +22,24 @@
             }
         },
         {
+            "id": "beleidskompas",
+            "name": "Beleidskompas",
+            "icon": "\uD83E\uDDED",
+            "description": "Vier-stappen ondersteuning voor provinciale beleidsafweging (SiS 4.0)",
+            "url": "/c/new",
+            "target": "beleidskompas",
+            "config": {
+                "specialist_team": "Bij hoge juridische/financiële impact: betrek concernjurist, financieel adviseur en programmaregisseur.",
+                "sources": [
+                    "SiS 4.0 Strategisch kader",
+                    "SiS 4.0 Uitvoeringskader",
+                    "Provinciale Instrumentenkoffer",
+                    "Coalitieakkoord en beleidskaders",
+                    "Overzicht wettelijke taken Provincie"
+                ]
+            }
+        },
+        {
             "id": "transcriptie",
             "name": "Live transcriptie",
             "icon": "\uD83C\uDFA4",
@@ -32,7 +50,7 @@
                 "webhook_token": "change-me",
                 "chunk_ms": 5000,
                 "max_duration_minutes": 120,
-                "litellm_model": "whisper",
+                "litellm_model": "gpt-4o-transcribe",
                 "language": "nl",
                 "enable_speaker_labels": true,
                 "include_timestamps": true

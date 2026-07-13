@@ -66,6 +66,12 @@ const ORCHESTRATOR_IMAGE_MAX_RESOLUTION_PX_DEFAULT = Math.max(
 );
 const LIBRECHAT_INTERNAL_URL = String(process.env.LIBRECHAT_INTERNAL_URL || "http://librechat:3080").trim();
 const TRANSCRIPT_SESSIONS_FILE = "transcript-sessions.json";
+const BELEIDSKOMPAS_STATE_FILE = "beleidskompas-state.json";
+const BELEIDSKOMPAS_LIVE_FILE = "beleidskompas-config.json";
+const BELEIDSKOMPAS_WORKFLOWS_DIR_NAME = "beleidskompas-workflows";
+const BELEIDSKOMPAS_HOOFDAGENT_WEBHOOK_PATH_DEFAULT = "beleidskompas-hoofdagent";
+const BELEIDSKOMPAS_N8N_BASE_URL = String(process.env.BELEIDSKOMPAS_N8N_BASE_URL || "http://n8n:5678").replace(/\/$/, "");
+const BELEIDSKOMPAS_N8N_WEBHOOK_TOKEN = String(process.env.BELEIDSKOMPAS_N8N_WEBHOOK_TOKEN || process.env.N8N_WEBHOOK_TOKEN || "").trim();
 const TRANSCRIPT_AUTH_DEBUG = String(process.env.TRANSCRIPT_AUTH_DEBUG || "false").toLowerCase() === "true";
 const LIBRECHAT_JWT_REFRESH_SECRET = String(process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET || "").trim();
 
@@ -336,6 +342,16 @@ function initDefaults() {
     fs.writeFileSync(crawlerRunsPath, JSON.stringify({ runs: [] }, null, 2), "utf-8");
     console.log(`[init] Created crawler-runs.json in ${DATA_DIR}`);
   }
+
+  const beleidskompasStatePath = path.join(DATA_DIR, BELEIDSKOMPAS_STATE_FILE);
+  if (!fs.existsSync(beleidskompasStatePath)) {
+    writePrivateJSON(BELEIDSKOMPAS_STATE_FILE, defaultBeleidskompasState());
+    console.log(`[init] Created ${BELEIDSKOMPAS_STATE_FILE} in ${DATA_DIR}`);
+  }
+
+  const beleidskompasState = readBeleidskompasState();
+  publishBeleidskompasLiveConfig(beleidskompasState.live || beleidskompasState.draft || defaultBeleidskompasFlow());
+  syncBeleidskompasWorkflowFiles(beleidskompasState);
 }
 
 function readJSON(filename) {
@@ -366,6 +382,687 @@ function writeJSON(filename, data) {
   fs.writeFileSync(filepath, JSON.stringify(data, null, 2), "utf-8");
   // Also publish to shared static volume for Open WebUI
   publishFile(filename, data);
+}
+
+function cloneJSON(input) {
+  return JSON.parse(JSON.stringify(input));
+}
+
+function normalizeTags(value) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map((v) => String(v || "").trim()).filter(Boolean))];
+}
+
+function slugifyPolicyText(value, fallback = "step") {
+  const slug = String(value || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+  return slug || fallback;
+}
+
+function buildStepWorkflowMeta(step, idx) {
+  const stepSlug = slugifyPolicyText(step?.id || step?.title || `step-${idx + 1}`, `step-${idx + 1}`);
+  const workflowId = String(step?.workflow_id || `govchat-beleidskompas-step-${stepSlug}`).trim();
+  const webhookPath = String(step?.webhook_path || `beleidskompas-step-${stepSlug}`).trim();
+  return {
+    workflow_id: workflowId || `govchat-beleidskompas-step-${stepSlug}`,
+    webhook_path: webhookPath || `beleidskompas-step-${stepSlug}`,
+  };
+}
+
+function defaultStepRagSettings(step = {}) {
+  return {
+    algorithm: "hybrid",
+    top_k: 3,
+    min_score: 0.08,
+    tag_filter_mode: "any",
+    required_tags: normalizeTags(step?.doc_tags || []),
+  };
+}
+
+function normalizeStepRagSettings(input, fallbackStep = {}) {
+  const fallback = defaultStepRagSettings(fallbackStep);
+  const src = input && typeof input === "object" ? input : {};
+  const algorithmRaw = String(src.algorithm || fallback.algorithm || "hybrid").trim().toLowerCase();
+  const algorithm = ["needle", "haystack", "hybrid"].includes(algorithmRaw) ? algorithmRaw : "hybrid";
+  const topK = Math.max(1, Math.min(20, Number.parseInt(String(src.top_k ?? fallback.top_k ?? 3), 10) || 3));
+  const minScore = Math.max(0, Math.min(1, Number.parseFloat(String(src.min_score ?? fallback.min_score ?? 0.08)) || 0));
+  const modeRaw = String(src.tag_filter_mode || fallback.tag_filter_mode || "any").trim().toLowerCase();
+  const tagFilterMode = modeRaw === "all" ? "all" : "any";
+  const requiredTags = normalizeTags(src.required_tags || fallback.required_tags || []);
+  return {
+    algorithm,
+    top_k: topK,
+    min_score: minScore,
+    tag_filter_mode: tagFilterMode,
+    required_tags: requiredTags,
+  };
+}
+
+function normalizeBeleidskompasDocuments(input) {
+  const documentsRaw = Array.isArray(input) ? input : [];
+  return documentsRaw.map((d) => ({
+    id: String(d?.id || crypto.randomUUID()).trim() || crypto.randomUUID(),
+    filename: String(d?.filename || "document").trim() || "document",
+    mime_type: String(d?.mime_type || "application/octet-stream").trim() || "application/octet-stream",
+    uploaded_at: String(d?.uploaded_at || new Date().toISOString()).trim(),
+    size_bytes: Math.max(0, Number(d?.size_bytes || 0)),
+    tags: normalizeTags(d?.tags || []),
+    preview_text: String(d?.preview_text || "").trim(),
+    content_base64: String(d?.content_base64 || "").trim(),
+  }));
+}
+
+function tokenizePolicyText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .map((w) => w.trim())
+    .filter((w) => w.length > 2);
+}
+
+function selectBeleidskompasRagDocs({ step, question = "", caseText = "", stepFields = {}, documents = [] }) {
+  const rag = normalizeStepRagSettings(step?.rag || {}, step || {});
+  const requiredTags = normalizeTags(rag.required_tags || []).map((t) => t.toLowerCase());
+  const modeAll = String(rag.tag_filter_mode || "any").toLowerCase() === "all";
+
+  const qBlob = [
+    question,
+    caseText,
+    stepFields?.problem,
+    stepFields?.causes,
+    stepFields?.symptoms,
+    stepFields?.perspectives,
+    stepFields?.references,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const queryWords = [...new Set(tokenizePolicyText(qBlob))];
+
+  const scored = normalizeBeleidskompasDocuments(documents)
+    .map((doc) => {
+      const tags = normalizeTags(doc.tags || []).map((t) => t.toLowerCase());
+      if (requiredTags.length) {
+        const tagMatch = modeAll ? requiredTags.every((t) => tags.includes(t)) : requiredTags.some((t) => tags.includes(t));
+        if (!tagMatch) return null;
+      }
+
+      const text = String(doc.preview_text || "").trim();
+      if (!text) return null;
+      const words = tokenizePolicyText(text);
+      if (!words.length) return null;
+
+      const wordSet = new Set(words);
+      const overlap = queryWords.filter((w) => wordSet.has(w)).length;
+      const overlapRatio = queryWords.length ? overlap / queryWords.length : 0;
+      const density = overlap / Math.max(24, words.length);
+      const lowerText = text.toLowerCase();
+      const needleHits = queryWords.reduce((acc, w) => (lowerText.includes(w) ? acc + 1 : acc), 0);
+      const needleScore = queryWords.length ? needleHits / queryWords.length : 0;
+      const haystackScore = overlapRatio * 0.7 + density * 0.3;
+
+      let score = needleScore * 0.55 + haystackScore * 0.45;
+      if (rag.algorithm === "needle") score = needleScore;
+      if (rag.algorithm === "haystack") score = haystackScore;
+
+      return {
+        id: doc.id,
+        filename: doc.filename,
+        tags: normalizeTags(doc.tags || []),
+        score,
+        preview: text.slice(0, 420),
+      };
+    })
+    .filter(Boolean)
+    .filter((d) => d.score >= Number(rag.min_score || 0))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, Math.max(1, Number(rag.top_k || 3)));
+
+  return {
+    rag,
+    docs: scored,
+  };
+}
+
+function defaultBeleidskompasFlow() {
+  return {
+    title: "Beleidskompas",
+    orchestrator_workflow_id: "govchat-beleidskompas-hoofdagent",
+    orchestrator_webhook_path: BELEIDSKOMPAS_HOOFDAGENT_WEBHOOK_PATH_DEFAULT,
+    webhook_token: String(BELEIDSKOMPAS_N8N_WEBHOOK_TOKEN || "").trim(),
+    disclaimer:
+      "Deze toepassing is een ondersteunend hulpmiddel en vervangt geen menselijke besluitvorming.",
+    specialist_team:
+      "Bij hoge juridische/financiële impact: betrek concernjurist, financieel adviseur en programmaregisseur.",
+    sources: [
+      "SiS 4.0 Strategisch kader",
+      "SiS 4.0 Uitvoeringskader",
+      "Provinciale Instrumentenkoffer",
+      "Coalitieakkoord en beleidskaders",
+      "Overzicht wettelijke taken Provincie",
+    ],
+    steps: [
+      {
+        id: "stap1",
+        workflow_id: "govchat-beleidskompas-step-stap1",
+        webhook_path: "beleidskompas-step-stap1",
+        title: "Publiek en provinciaal belang",
+        description:
+          "Bepaal probleem, publiek belang en provinciale legitimiteit op basis van wettelijke taken en beleidskaders.",
+        prompt:
+          "Toets publiek en provinciaal belang. Benoem doelgroep, maatschappelijke impact, legitimiteit en conflicterende belangen.",
+        doc_tags: ["Beleid", "Governance"],
+        rag: {
+          algorithm: "needle",
+          top_k: 3,
+          min_score: 0.12,
+          tag_filter_mode: "any",
+          required_tags: ["Beleid", "Governance"],
+        },
+        substeps: [
+          { id: "1.1", title: "Casus context", description: "Afbakening van de opgave en context." },
+          { id: "1.2", title: "Toetsing publiek", description: "Is er aantoonbaar publiek belang?" },
+          { id: "1.3", title: "Toetsing provinciaal", description: "Valt dit onder provinciaal belang/mandaat?" },
+        ],
+      },
+      {
+        id: "stap2",
+        workflow_id: "govchat-beleidskompas-step-stap2",
+        webhook_path: "beleidskompas-step-stap2",
+        title: "Rolbepaling",
+        description:
+          "Kies passende provinciale rol(len): regulerend, regisserend, stimulerend of faciliterend.",
+        prompt:
+          "Onderbouw de provinciale rolkeuze met impact, uitvoerbaarheid, bestuurlijke haalbaarheid en risico’s.",
+        doc_tags: ["Governance"],
+        rag: {
+          algorithm: "hybrid",
+          top_k: 4,
+          min_score: 0.09,
+          tag_filter_mode: "any",
+          required_tags: ["Governance"],
+        },
+        substeps: [
+          { id: "2.1", title: "Rolopties", description: "Verken geschikte rollen." },
+          { id: "2.2", title: "Afweging", description: "Weeg effectiviteit, risico en legitimiteit." },
+        ],
+      },
+      {
+        id: "stap3",
+        workflow_id: "govchat-beleidskompas-step-stap3",
+        webhook_path: "beleidskompas-step-stap3",
+        title: "Instrumentkeuze",
+        description:
+          "Vergelijk beleids- en uitvoeringsinstrumenten, inclusief argumentatie, risicobeoordeling en alternatieven.",
+        prompt:
+          "Scoor instrumenten op effectiviteit, juridische robuustheid, financiën en uitvoerbaarheid. Geef voorkeursoptie met alternatieven.",
+        doc_tags: ["Beleid", "Compliance"],
+        rag: {
+          algorithm: "haystack",
+          top_k: 5,
+          min_score: 0.06,
+          tag_filter_mode: "any",
+          required_tags: ["Beleid", "Compliance"],
+        },
+        substeps: [
+          { id: "3.1", title: "Selectie", description: "Kies realistische instrumenten." },
+          { id: "3.2", title: "Weging", description: "Onderbouw score en risico per optie." },
+          { id: "3.3", title: "Voorkeur", description: "Motiveer voorkeursinstrument en alternatieven." },
+        ],
+      },
+      {
+        id: "stap4",
+        workflow_id: "govchat-beleidskompas-step-stap4",
+        webhook_path: "beleidskompas-step-stap4",
+        title: "Governance-inrichting",
+        description:
+          "Adviseer inrichting voor sturing, toezicht, beheersing en verantwoording, inclusief KPI’s.",
+        prompt:
+          "Werk governance-advies uit conform SiS 4.0 hoofdstuk 10 en het uitvoeringskader. Neem ook alternatieven mee.",
+        doc_tags: ["Governance", "Compliance"],
+        rag: {
+          algorithm: "hybrid",
+          top_k: 4,
+          min_score: 0.1,
+          tag_filter_mode: "all",
+          required_tags: ["Governance", "Compliance"],
+        },
+        substeps: [
+          { id: "4.1", title: "Sturing", description: "Eigenaarschap, mandaat en besluitvorming." },
+          { id: "4.2", title: "Toezicht", description: "Toetsing, escalatie en verantwoording." },
+          { id: "4.3", title: "KPI’s", description: "Monitorings- en rapportageafspraken." },
+        ],
+      },
+    ],
+  };
+}
+
+function normalizeBeleidskompasFlow(input) {
+  const fallback = defaultBeleidskompasFlow();
+  const src = input && typeof input === "object" ? input : {};
+  const stepsRaw = Array.isArray(src.steps) ? src.steps : fallback.steps;
+
+  const steps = stepsRaw.map((step, idx) => {
+    const fb = fallback.steps[Math.min(idx, fallback.steps.length - 1)] || fallback.steps[0];
+    const substepsRaw = Array.isArray(step?.substeps) ? step.substeps : fb.substeps;
+    const workflowMeta = buildStepWorkflowMeta(step, idx);
+    return {
+      id: String(step?.id || fb.id || `stap${idx + 1}`).trim() || `stap${idx + 1}`,
+      workflow_id: workflowMeta.workflow_id,
+      webhook_path: workflowMeta.webhook_path,
+      title: String(step?.title || fb.title || `Stap ${idx + 1}`).trim() || `Stap ${idx + 1}`,
+      description: String(step?.description || fb.description || "").trim(),
+      prompt: String(step?.prompt || fb.prompt || "").trim(),
+      doc_tags: normalizeTags(step?.doc_tags || fb.doc_tags),
+      rag: normalizeStepRagSettings(step?.rag || fb.rag || {}, step || fb),
+      substeps: substepsRaw.map((sub, subIdx) => ({
+        id: String(sub?.id || `${idx + 1}.${subIdx + 1}`).trim() || `${idx + 1}.${subIdx + 1}`,
+        title: String(sub?.title || `Substap ${subIdx + 1}`).trim() || `Substap ${subIdx + 1}`,
+        description: String(sub?.description || "").trim(),
+      })),
+    };
+  });
+
+  return {
+    title: String(src.title || fallback.title).trim() || fallback.title,
+    orchestrator_workflow_id:
+      String(src.orchestrator_workflow_id || fallback.orchestrator_workflow_id || "govchat-beleidskompas-hoofdagent").trim() ||
+      "govchat-beleidskompas-hoofdagent",
+    orchestrator_webhook_path:
+      String(src.orchestrator_webhook_path || fallback.orchestrator_webhook_path || BELEIDSKOMPAS_HOOFDAGENT_WEBHOOK_PATH_DEFAULT).trim() ||
+      BELEIDSKOMPAS_HOOFDAGENT_WEBHOOK_PATH_DEFAULT,
+    webhook_token: String(src.webhook_token || fallback.webhook_token || "").trim(),
+    disclaimer: String(src.disclaimer || fallback.disclaimer).trim() || fallback.disclaimer,
+    specialist_team: String(src.specialist_team || fallback.specialist_team).trim() || fallback.specialist_team,
+    sources: normalizeTags(src.sources || fallback.sources),
+    steps,
+  };
+}
+
+function defaultBeleidskompasState() {
+  const baseFlow = defaultBeleidskompasFlow();
+  const now = new Date().toISOString();
+  return {
+    draft: cloneJSON(baseFlow),
+    live: cloneJSON(baseFlow),
+    live_version_id: "v1",
+    versions: [
+      {
+        id: "v1",
+        published_at: now,
+        published_by: "System",
+        note: "Initiële versie",
+        is_live: true,
+        snapshot: cloneJSON(baseFlow),
+      },
+    ],
+    documents: [],
+    settings: {
+      retention_days: 365,
+      enforce_source_citation: true,
+      require_human_validation: true,
+      default_model: "govchat-default",
+    },
+  };
+}
+
+function normalizeBeleidskompasState(input) {
+  const fallback = defaultBeleidskompasState();
+  const src = input && typeof input === "object" ? input : {};
+  const draft = normalizeBeleidskompasFlow(src.draft || src.flow || fallback.draft);
+  const live = normalizeBeleidskompasFlow(src.live || fallback.live);
+  const versionsRaw = Array.isArray(src.versions) ? src.versions : fallback.versions;
+  const versions = versionsRaw.map((v, idx) => ({
+    id: String(v?.id || `v${idx + 1}`).trim() || `v${idx + 1}`,
+    published_at: String(v?.published_at || new Date().toISOString()).trim(),
+    published_by: String(v?.published_by || "Onbekend").trim() || "Onbekend",
+    note: String(v?.note || "").trim(),
+    is_live: Boolean(v?.is_live),
+    snapshot: normalizeBeleidskompasFlow(v?.snapshot || draft),
+  }));
+
+  const documents = normalizeBeleidskompasDocuments(src.documents || []);
+
+  const settings = {
+    ...fallback.settings,
+    ...(src.settings && typeof src.settings === "object" ? src.settings : {}),
+  };
+
+  let liveVersionId = String(src.live_version_id || fallback.live_version_id || "").trim();
+  if (!versions.some((v) => v.id === liveVersionId)) {
+    liveVersionId = versions[0]?.id || "v1";
+  }
+  for (const v of versions) {
+    v.is_live = v.id === liveVersionId;
+  }
+
+  return {
+    draft,
+    live,
+    live_version_id: liveVersionId,
+    versions,
+    documents,
+    settings,
+  };
+}
+
+function readBeleidskompasState() {
+  const raw = readPrivateJSON(BELEIDSKOMPAS_STATE_FILE);
+  return normalizeBeleidskompasState(raw || defaultBeleidskompasState());
+}
+
+function writeBeleidskompasState(state) {
+  const normalized = normalizeBeleidskompasState(state);
+  writePrivateJSON(BELEIDSKOMPAS_STATE_FILE, normalized);
+  return normalized;
+}
+
+function publishBeleidskompasLiveConfig(flow) {
+  const normalized = normalizeBeleidskompasFlow(flow);
+  writeJSON(BELEIDSKOMPAS_LIVE_FILE, normalized);
+}
+
+function ensureBeleidskompasWorkflowsDir() {
+  ensureDataDir();
+  const dir = path.join(DATA_DIR, BELEIDSKOMPAS_WORKFLOWS_DIR_NAME);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function buildBeleidskompasStepWorkflow(flow, step, idx, documentsInput = []) {
+  const wf = buildStepWorkflowMeta(step, idx);
+  const stepId = String(step?.id || `stap${idx + 1}`).trim() || `stap${idx + 1}`;
+  const title = String(step?.title || `Stap ${idx + 1}`).trim() || `Stap ${idx + 1}`;
+  const prompt = String(step?.prompt || "").trim();
+  const sources = Array.isArray(flow?.sources) ? flow.sources : [];
+  const rag = normalizeStepRagSettings(step?.rag || {}, step);
+  const documents = normalizeBeleidskompasDocuments(documentsInput).map((d) => ({
+    id: d.id,
+    filename: d.filename,
+    tags: normalizeTags(d.tags || []),
+    text: String(d.preview_text || "").slice(0, 6000),
+  }));
+  return {
+    id: wf.workflow_id,
+    name: `Beleidskompas Specialist - ${title}`,
+    active: true,
+    nodes: [
+      {
+        parameters: {
+          httpMethod: "POST",
+          path: wf.webhook_path,
+          responseMode: "responseNode",
+          options: {},
+        },
+        id: "WebhookStep",
+        name: "Webhook Step",
+        type: "n8n-nodes-base.webhook",
+        typeVersion: 2,
+        webhookId: wf.workflow_id,
+        position: [-620, 200],
+      },
+      {
+        parameters: {
+          jsCode:
+            `const raw = $json || {};\n` +
+            `const body = raw.body || {};\n` +
+            `const headers = raw.headers || {};\n` +
+            `const suppliedToken = String(headers['x-govchat-token'] || headers['X-Govchat-Token'] || '').trim();\n` +
+            `const expectedToken = String($env.BELEIDSKOMPAS_N8N_WEBHOOK_TOKEN || $env.N8N_WEBHOOK_TOKEN || '').trim();\n` +
+            `if (expectedToken && suppliedToken !== expectedToken) throw new Error('Unauthorized webhook token');\n` +
+            `const question = String(body.question || '').trim();\n` +
+            `const fields = body.step_fields && typeof body.step_fields === 'object' ? body.step_fields : {};\n` +
+            `const context = String(body.case_text || '').trim();\n` +
+            `const rag = ${JSON.stringify(rag)};\n` +
+            `const docs = ${JSON.stringify(documents)};\n` +
+            `const refs = ${JSON.stringify(sources)};\n` +
+            `const toWords = (s) => String(s || '').toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter((w) => w.length > 2);\n` +
+            `const uniq = (arr) => [...new Set(arr)];\n` +
+            `const textBlob = [question, context, fields.problem, fields.causes, fields.symptoms, fields.perspectives, fields.references].filter(Boolean).join(' ');\n` +
+            `const qWords = uniq(toWords(textBlob));\n` +
+            `const requiredTags = Array.isArray(rag.required_tags) ? rag.required_tags.map((t) => String(t).toLowerCase()) : [];\n` +
+            `const modeAll = String(rag.tag_filter_mode || 'any').toLowerCase() === 'all';\n` +
+            `const matchesTags = (doc) => {\n` +
+            `  if (!requiredTags.length) return true;\n` +
+            `  const tags = Array.isArray(doc.tags) ? doc.tags.map((t) => String(t).toLowerCase()) : [];\n` +
+            `  return modeAll ? requiredTags.every((t) => tags.includes(t)) : requiredTags.some((t) => tags.includes(t));\n` +
+            `};\n` +
+            `const scoreDoc = (doc) => {\n` +
+            `  const text = String(doc.text || '');\n` +
+            `  if (!text.trim()) return 0;\n` +
+            `  const words = toWords(text);\n` +
+            `  if (!words.length) return 0;\n` +
+            `  const set = new Set(words);\n` +
+            `  const overlap = qWords.filter((w) => set.has(w)).length;\n` +
+            `  const overlapRatio = qWords.length ? overlap / qWords.length : 0;\n` +
+            `  const density = overlap / Math.max(24, words.length);\n` +
+            `  let needleHits = 0;\n` +
+            `  const lowerText = String(text).toLowerCase();\n` +
+            `  for (const w of qWords) { if (lowerText.includes(w)) needleHits += 1; }\n` +
+            `  const needleScore = qWords.length ? needleHits / qWords.length : 0;\n` +
+            `  const haystackScore = overlapRatio * 0.7 + density * 0.3;\n` +
+            `  const algo = String(rag.algorithm || 'hybrid').toLowerCase();\n` +
+            `  if (algo === 'needle') return needleScore;\n` +
+            `  if (algo === 'haystack') return haystackScore;\n` +
+            `  return needleScore * 0.55 + haystackScore * 0.45;\n` +
+            `};\n` +
+            `const ranked = docs\n` +
+            `  .filter(matchesTags)\n` +
+            `  .map((d) => ({ ...d, score: scoreDoc(d) }))\n` +
+            `  .filter((d) => d.score >= Number(rag.min_score || 0))\n` +
+            `  .sort((a, b) => b.score - a.score)\n` +
+            `  .slice(0, Math.max(1, Number(rag.top_k || 3)));\n` +
+            `const citations = ranked.map((d, i) => ({ rank: i + 1, id: d.id, filename: d.filename, score: Number(d.score.toFixed(4)), tags: d.tags, preview: String(d.text || '').slice(0, 900) }));\n` +
+            `const lines = [];\n` +
+            `lines.push('Stap: ${stepId} - ${title}');\n` +
+            `if (context) lines.push('Casus: ' + context);\n` +
+            `if (fields.problem) lines.push('Probleemdefinitie: ' + String(fields.problem));\n` +
+            `if (fields.causes) lines.push('Oorzaken: ' + String(fields.causes));\n` +
+            `if (fields.symptoms) lines.push('Symptomen: ' + String(fields.symptoms));\n` +
+            `if (fields.perspectives) lines.push('Ontbrekend perspectief: ' + String(fields.perspectives));\n` +
+            `if (fields.references) lines.push('Bronverwijzingen: ' + String(fields.references));\n` +
+            `if (question) lines.push('Vraag: ' + question);\n` +
+            `lines.push('Promptkader: ${prompt.replace(/`/g, "'")}');\n` +
+            `if (ranked.length) {\n` +
+            `  lines.push('Geraadpleegde bronnen (' + ranked.length + '): ' + ranked.map((d) => d.filename + ' [' + d.score.toFixed(3) + ']').join('; '));\n` +
+            `} else {\n` +
+            `  lines.push('Geraadpleegde bronnen: geen matches op huidige RAG-filter/score.');\n` +
+            `}\n` +
+            `lines.push('Bekende bronnen: ' + refs.join('; '));\n` +
+            `return [{ json: { text: lines.join('\\n'), citations, retrieval_trace: { algorithm: rag.algorithm, top_k: rag.top_k, min_score: rag.min_score, tag_filter_mode: rag.tag_filter_mode, required_tags: rag.required_tags, matched_docs: ranked.length } } }];`,
+        },
+        id: "BuildStepAnswer",
+        name: "Build Step Answer",
+        type: "n8n-nodes-base.code",
+        typeVersion: 2,
+        position: [-360, 200],
+      },
+      {
+        parameters: {
+          respondWith: "json",
+          responseBody:
+            '={{ JSON.stringify({ ok: true, step_id: "' + stepId + '", answer: $json.text, citations: $json.citations || [], retrieval_trace: $json.retrieval_trace || null }) }}',
+          options: {},
+        },
+        id: "RespondStep",
+        name: "Respond Step",
+        type: "n8n-nodes-base.respondToWebhook",
+        typeVersion: 1,
+        position: [-120, 200],
+      },
+    ],
+    connections: {
+      "Webhook Step": {
+        main: [[{ node: "Build Step Answer", type: "main", index: 0 }]],
+      },
+      "Build Step Answer": {
+        main: [[{ node: "Respond Step", type: "main", index: 0 }]],
+      },
+    },
+    settings: { executionOrder: "v1" },
+  };
+}
+
+function buildBeleidskompasHoofdagentWorkflow(flow) {
+  const orchestratorWorkflowId =
+    String(flow?.orchestrator_workflow_id || "govchat-beleidskompas-hoofdagent").trim() || "govchat-beleidskompas-hoofdagent";
+  const orchestratorWebhookPath =
+    String(flow?.orchestrator_webhook_path || BELEIDSKOMPAS_HOOFDAGENT_WEBHOOK_PATH_DEFAULT).trim() ||
+    BELEIDSKOMPAS_HOOFDAGENT_WEBHOOK_PATH_DEFAULT;
+  const steps = Array.isArray(flow?.steps) ? flow.steps : [];
+  return {
+    id: orchestratorWorkflowId,
+    name: "Beleidskompas Hoofdagent",
+    active: true,
+    nodes: [
+      {
+        parameters: {
+          httpMethod: "POST",
+          path: orchestratorWebhookPath,
+          responseMode: "responseNode",
+          options: {},
+        },
+        id: "WebhookHoofdagent",
+        name: "Webhook Hoofdagent",
+        type: "n8n-nodes-base.webhook",
+        typeVersion: 2,
+        webhookId: orchestratorWorkflowId,
+        position: [-740, 240],
+      },
+      {
+        parameters: {
+          jsCode:
+            `const raw = $json || {};\n` +
+            `const body = raw.body || {};\n` +
+            `const headers = raw.headers || {};\n` +
+            `const suppliedToken = String(headers['x-govchat-token'] || headers['X-Govchat-Token'] || '').trim();\n` +
+            `const expectedToken = String($env.BELEIDSKOMPAS_N8N_WEBHOOK_TOKEN || $env.N8N_WEBHOOK_TOKEN || '').trim();\n` +
+            `if (expectedToken && suppliedToken !== expectedToken) throw new Error('Unauthorized webhook token');\n` +
+            `const steps = ${JSON.stringify(steps.map((s, idx) => {
+              const m = buildStepWorkflowMeta(s, idx);
+              return { id: s.id, title: s.title, webhook_path: m.webhook_path };
+            }))};\n` +
+            `const stepId = String(body.step_id || '').trim();\n` +
+            `let step = steps.find((s) => String(s.id) === stepId);\n` +
+            `if (!step) step = steps[0] || null;\n` +
+            `if (!step) throw new Error('Geen stappen geconfigureerd');\n` +
+            `return [{ json: { route: step, payload: body } }];`,
+        },
+        id: "RouteStep",
+        name: "Route Step",
+        type: "n8n-nodes-base.code",
+        typeVersion: 2,
+        position: [-500, 240],
+      },
+      {
+        parameters: {
+          method: "POST",
+          url: `={{'${BELEIDSKOMPAS_N8N_BASE_URL}/webhook/' + $json.route.webhook_path}}`,
+          sendHeaders: true,
+          headerParameters: {
+            parameters: [
+              { name: "Content-Type", value: "application/json" },
+              {
+                name: "x-govchat-token",
+                value: "={{ String($env.BELEIDSKOMPAS_N8N_WEBHOOK_TOKEN || $env.N8N_WEBHOOK_TOKEN || '') }}",
+              },
+            ],
+          },
+          sendBody: true,
+          specifyBody: "json",
+          jsonBody: "={{ JSON.stringify($json.payload || {}) }}",
+          options: { timeout: 120000 },
+        },
+        id: "CallStepWorkflow",
+        name: "Call Step Workflow",
+        type: "n8n-nodes-base.httpRequest",
+        typeVersion: 4.2,
+        position: [-240, 240],
+      },
+      {
+        parameters: {
+          respondWith: "json",
+          responseBody:
+            '={{ JSON.stringify({ ok: true, route: $json.step_id || null, answer: $json.answer || $json.text || "", citations: $json.citations || [], retrieval_trace: $json.retrieval_trace || null }) }}',
+          options: {},
+        },
+        id: "RespondHoofdagent",
+        name: "Respond Hoofdagent",
+        type: "n8n-nodes-base.respondToWebhook",
+        typeVersion: 1,
+        position: [20, 240],
+      },
+    ],
+    connections: {
+      "Webhook Hoofdagent": { main: [[{ node: "Route Step", type: "main", index: 0 }]] },
+      "Route Step": { main: [[{ node: "Call Step Workflow", type: "main", index: 0 }]] },
+      "Call Step Workflow": { main: [[{ node: "Respond Hoofdagent", type: "main", index: 0 }]] },
+    },
+    settings: { executionOrder: "v1" },
+  };
+}
+
+function syncBeleidskompasWorkflowFiles(flowInput) {
+  let flow = defaultBeleidskompasFlow();
+  let documents = [];
+  if (flowInput && typeof flowInput === "object" && (flowInput.draft || flowInput.live || flowInput.documents)) {
+    const state = normalizeBeleidskompasState(flowInput);
+    flow = normalizeBeleidskompasFlow(state.draft || state.live || defaultBeleidskompasFlow());
+    documents = normalizeBeleidskompasDocuments(state.documents || []);
+  } else {
+    flow = normalizeBeleidskompasFlow(flowInput || defaultBeleidskompasFlow());
+  }
+  const dir = ensureBeleidskompasWorkflowsDir();
+  const steps = Array.isArray(flow.steps) ? flow.steps : [];
+
+  const stepFiles = steps.map((step, idx) => {
+    const meta = buildStepWorkflowMeta(step, idx);
+    const wf = buildBeleidskompasStepWorkflow(flow, step, idx, documents);
+    const filename = `${meta.workflow_id}.json`;
+    fs.writeFileSync(path.join(dir, filename), `${JSON.stringify([wf], null, 2)}\n`, "utf-8");
+    return {
+      step_id: String(step?.id || `stap${idx + 1}`),
+      workflow_id: meta.workflow_id,
+      webhook_path: meta.webhook_path,
+      file: `${BELEIDSKOMPAS_WORKFLOWS_DIR_NAME}/${filename}`,
+    };
+  });
+
+  const hoofd = buildBeleidskompasHoofdagentWorkflow(flow);
+  const hoofdFile = `${String(hoofd.id || "govchat-beleidskompas-hoofdagent")}.json`;
+  fs.writeFileSync(path.join(dir, hoofdFile), `${JSON.stringify([hoofd], null, 2)}\n`, "utf-8");
+
+  const manifest = {
+    generated_at: new Date().toISOString(),
+    n8n_base_url: BELEIDSKOMPAS_N8N_BASE_URL,
+    webhook_token_configured: Boolean(BELEIDSKOMPAS_N8N_WEBHOOK_TOKEN),
+    orchestrator: {
+      workflow_id: String(flow.orchestrator_workflow_id || hoofd.id || "govchat-beleidskompas-hoofdagent"),
+      webhook_path: String(flow.orchestrator_webhook_path || BELEIDSKOMPAS_HOOFDAGENT_WEBHOOK_PATH_DEFAULT),
+      file: `${BELEIDSKOMPAS_WORKFLOWS_DIR_NAME}/${hoofdFile}`,
+    },
+    steps: stepFiles,
+  };
+  fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify(manifest, null, 2), "utf-8");
+  return manifest;
+}
+
+function readBeleidskompasWorkflowManifest() {
+  const dir = ensureBeleidskompasWorkflowsDir();
+  const file = path.join(dir, "manifest.json");
+  if (!fs.existsSync(file)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf-8"));
+  } catch {
+    return null;
+  }
 }
 
 function publishFile(filename, data) {
@@ -402,6 +1099,8 @@ function publishAll() {
     const data = readJSON(file);
     if (data) publishFile(file, data);
   }
+  const bkState = readBeleidskompasState();
+  publishBeleidskompasLiveConfig(bkState.live || bkState.draft || defaultBeleidskompasFlow());
   const rawFiles = ["loader.js", "custom.css"];
   for (const file of rawFiles) {
     publishFileRaw(file);
@@ -1884,8 +2583,18 @@ app.get("/dashboard", requireAuth, (req, res) => {
   const appsData = readJSON("apps.json");
   const crawlerConfig = readCrawlerConfig();
   const orchestratorConfig = readOrchestratorConfig();
+  const beleidskompasState = readBeleidskompasState();
   const helpSections = helpData?.sections?.length || 0;
   const appCount = appsData?.apps?.length || 0;
+  const beleidskompasStepCount = Array.isArray(beleidskompasState?.live?.steps)
+    ? beleidskompasState.live.steps.length
+    : 0;
+  const beleidskompasVersionCount = Array.isArray(beleidskompasState?.versions)
+    ? beleidskompasState.versions.length
+    : 0;
+  const beleidskompasDocCount = Array.isArray(beleidskompasState?.documents)
+    ? beleidskompasState.documents.length
+    : 0;
   sendView(res, "dashboard.html", {
     helpSections: String(helpSections),
     appCount: String(appCount),
@@ -1894,6 +2603,9 @@ app.get("/dashboard", requireAuth, (req, res) => {
     orchestratorImageCap: String(orchestratorConfig?.image_data_url_max_chars || ORCHESTRATOR_IMAGE_DATA_URL_MAX_CHARS_DEFAULT),
     helpTitle: helpData?.title || "(niet ingesteld)",
     appsTitle: appsData?.title || "(niet ingesteld)",
+    beleidskompasVersionCount: String(beleidskompasVersionCount),
+    beleidskompasStepCount: String(beleidskompasStepCount),
+    beleidskompasDocCount: String(beleidskompasDocCount),
   });
 });
 
@@ -1924,6 +2636,12 @@ app.get("/apps-editor", requireAuth, (req, res) => {
   });
 });
 
+app.get("/beleidskompas-editor", requireAuth, (req, res) => {
+  sendView(res, "beleidskompas-editor.html", {
+    jsonData: JSON.stringify(readBeleidskompasState()),
+  });
+});
+
 // ── Admin API endpoints (auth required) ────────────────────────────
 app.post("/api/config/help-content", requireAuth, (req, res) => {
   try {
@@ -1940,6 +2658,307 @@ app.post("/api/config/apps", requireAuth, (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/beleidskompas/state", requireAuth, (req, res) => {
+  const state = readBeleidskompasState();
+  const workflow_manifest = readBeleidskompasWorkflowManifest();
+  return res.json({ ok: true, state, workflow_manifest });
+});
+
+app.get("/api/beleidskompas/export", requireAuth, (req, res) => {
+  const state = readBeleidskompasState();
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  return res.status(200).send(JSON.stringify(state, null, 2));
+});
+
+app.post("/api/beleidskompas/import", requireAuth, (req, res) => {
+  try {
+    const incoming = req.body && typeof req.body === "object" ? req.body : {};
+    const current = readBeleidskompasState();
+    const next = {
+      ...current,
+      ...(incoming.state && typeof incoming.state === "object" ? incoming.state : incoming),
+    };
+    const saved = writeBeleidskompasState(next);
+    const workflow_manifest = syncBeleidskompasWorkflowFiles(saved);
+    return res.json({ ok: true, state: saved, workflow_manifest });
+  } catch (err) {
+    return res.status(400).json({ error: String(err?.message || err) });
+  }
+});
+
+app.post("/api/beleidskompas/draft", requireAuth, (req, res) => {
+  try {
+    const state = readBeleidskompasState();
+    const flow = normalizeBeleidskompasFlow(req.body?.flow || req.body || state.draft);
+    state.draft = flow;
+    const saved = writeBeleidskompasState(state);
+    const workflow_manifest = syncBeleidskompasWorkflowFiles(saved);
+    return res.json({ ok: true, draft: saved.draft, workflow_manifest });
+  } catch (err) {
+    return res.status(400).json({ error: String(err?.message || err) });
+  }
+});
+
+app.post("/api/beleidskompas/settings", requireAuth, (req, res) => {
+  try {
+    const state = readBeleidskompasState();
+    const incoming = req.body && typeof req.body === "object" ? req.body : {};
+    const nextSettings = {
+      ...state.settings,
+      ...incoming,
+      retention_days: Math.max(1, Number.parseInt(String(incoming.retention_days ?? state.settings?.retention_days ?? 365), 10) || 365),
+      enforce_source_citation: Boolean(
+        Object.prototype.hasOwnProperty.call(incoming, "enforce_source_citation")
+          ? incoming.enforce_source_citation
+          : state.settings?.enforce_source_citation,
+      ),
+      require_human_validation: Boolean(
+        Object.prototype.hasOwnProperty.call(incoming, "require_human_validation")
+          ? incoming.require_human_validation
+          : state.settings?.require_human_validation,
+      ),
+      default_model: String(incoming.default_model ?? state.settings?.default_model ?? "govchat-default").trim() || "govchat-default",
+    };
+    state.settings = nextSettings;
+    const saved = writeBeleidskompasState(state);
+    return res.json({ ok: true, settings: saved.settings });
+  } catch (err) {
+    return res.status(400).json({ error: String(err?.message || err) });
+  }
+});
+
+app.post("/api/beleidskompas/publish", requireAuth, (req, res) => {
+  try {
+    const state = readBeleidskompasState();
+    const flow = normalizeBeleidskompasFlow(req.body?.flow || state.draft || state.live);
+    const note = String(req.body?.note || "").trim();
+    const versionId = `v${Date.now()}`;
+    const who = "System Administrator";
+    const publishedAt = new Date().toISOString();
+
+    for (const v of state.versions) v.is_live = false;
+    const version = {
+      id: versionId,
+      published_at: publishedAt,
+      published_by: who,
+      note,
+      is_live: true,
+      snapshot: cloneJSON(flow),
+    };
+    state.versions.unshift(version);
+    state.live_version_id = versionId;
+    state.live = cloneJSON(flow);
+    state.draft = cloneJSON(flow);
+
+    const saved = writeBeleidskompasState(state);
+    publishBeleidskompasLiveConfig(saved.live);
+    const workflow_manifest = syncBeleidskompasWorkflowFiles(saved);
+    return res.json({ ok: true, version, live: saved.live, workflow_manifest });
+  } catch (err) {
+    return res.status(400).json({ error: String(err?.message || err) });
+  }
+});
+
+app.post("/api/beleidskompas/rollback/:versionId", requireAuth, (req, res) => {
+  const versionId = String(req.params.versionId || "").trim();
+  if (!versionId) return res.status(400).json({ error: "versionId ontbreekt" });
+
+  const state = readBeleidskompasState();
+  const target = state.versions.find((v) => String(v.id || "") === versionId);
+  if (!target) return res.status(404).json({ error: "Versie niet gevonden" });
+
+  state.live_version_id = versionId;
+  state.live = normalizeBeleidskompasFlow(target.snapshot);
+  state.draft = normalizeBeleidskompasFlow(target.snapshot);
+  for (const v of state.versions) v.is_live = v.id === versionId;
+
+  const saved = writeBeleidskompasState(state);
+  publishBeleidskompasLiveConfig(saved.live);
+  const workflow_manifest = syncBeleidskompasWorkflowFiles(saved);
+  return res.json({ ok: true, live: saved.live, version_id: versionId, workflow_manifest });
+});
+
+app.get("/api/beleidskompas/workflows/status", requireAuth, (req, res) => {
+  const state = readBeleidskompasState();
+  const source = String(req.query?.source || "draft").trim().toLowerCase();
+  const flow =
+    source === "live"
+      ? normalizeBeleidskompasFlow(state.live || state.draft || defaultBeleidskompasFlow())
+      : normalizeBeleidskompasFlow(state.draft || state.live || defaultBeleidskompasFlow());
+  const manifest = readBeleidskompasWorkflowManifest();
+  const expectedStepCount = Array.isArray(flow.steps) ? flow.steps.length : 0;
+  const mappedStepCount = Array.isArray(manifest?.steps) ? manifest.steps.length : 0;
+  const stepMismatch = expectedStepCount !== mappedStepCount;
+
+  return res.json({
+    ok: true,
+    n8n_base_url: BELEIDSKOMPAS_N8N_BASE_URL,
+    token_configured: Boolean(BELEIDSKOMPAS_N8N_WEBHOOK_TOKEN),
+    step_count_expected: expectedStepCount,
+    step_count_mapped: mappedStepCount,
+    step_mismatch: stepMismatch,
+    manifest: manifest || null,
+  });
+});
+
+app.post("/api/beleidskompas/workflows/sync", requireAuth, (req, res) => {
+  try {
+    const state = readBeleidskompasState();
+    const useLive = String(req.body?.source || "").trim().toLowerCase() === "live";
+    const flow = useLive
+      ? normalizeBeleidskompasFlow(state.live || defaultBeleidskompasFlow())
+      : normalizeBeleidskompasFlow(state.draft || state.live || defaultBeleidskompasFlow());
+    const manifest = syncBeleidskompasWorkflowFiles({ ...state, draft: flow });
+    return res.json({ ok: true, source: useLive ? "live" : "draft", manifest });
+  } catch (err) {
+    return res.status(500).json({ error: String(err?.message || err) });
+  }
+});
+
+app.get("/api/beleidskompas/documents", requireAuth, (req, res) => {
+  const state = readBeleidskompasState();
+  const docs = state.documents.map((d) => ({
+    ...d,
+    content_base64: undefined,
+  }));
+  return res.json({ ok: true, documents: docs });
+});
+
+app.post("/api/beleidskompas/documents", requireAuth, (req, res) => {
+  try {
+    const filename = String(req.body?.filename || "").trim();
+    const mimeType = String(req.body?.mime_type || "application/octet-stream").trim();
+    const contentBase64 = String(req.body?.content_base64 || "").trim();
+    const tags = normalizeTags(req.body?.tags || []);
+    if (!filename) return res.status(400).json({ error: "filename ontbreekt" });
+
+    const bytes = contentBase64 ? Buffer.from(contentBase64, "base64") : Buffer.from("");
+    let previewText = "Preview niet beschikbaar voor dit documenttype.";
+    if (mimeType.startsWith("text/") || filename.toLowerCase().endsWith(".md") || filename.toLowerCase().endsWith(".txt")) {
+      previewText = bytes.toString("utf-8").slice(0, 4000);
+    }
+
+    const state = readBeleidskompasState();
+    const doc = {
+      id: crypto.randomUUID(),
+      filename,
+      mime_type: mimeType,
+      uploaded_at: new Date().toISOString(),
+      size_bytes: bytes.length,
+      tags,
+      preview_text: previewText,
+      content_base64: contentBase64,
+    };
+    state.documents.unshift(doc);
+    const saved = writeBeleidskompasState(state);
+    const workflow_manifest = syncBeleidskompasWorkflowFiles(saved);
+
+    return res.status(201).json({ ok: true, document: { ...doc, content_base64: undefined }, workflow_manifest });
+  } catch (err) {
+    return res.status(400).json({ error: String(err?.message || err) });
+  }
+});
+
+app.patch("/api/beleidskompas/documents/:docId", requireAuth, (req, res) => {
+  const docId = String(req.params.docId || "").trim();
+  if (!docId) return res.status(400).json({ error: "docId ontbreekt" });
+
+  const state = readBeleidskompasState();
+  const idx = state.documents.findIndex((d) => String(d.id || "") === docId);
+  if (idx < 0) return res.status(404).json({ error: "Document niet gevonden" });
+
+  const current = state.documents[idx];
+  current.tags = normalizeTags(req.body?.tags || current.tags || []);
+  current.filename = String(req.body?.filename || current.filename || "document").trim() || "document";
+  state.documents[idx] = current;
+  const saved = writeBeleidskompasState(state);
+  const workflow_manifest = syncBeleidskompasWorkflowFiles(saved);
+  return res.json({ ok: true, document: { ...current, content_base64: undefined }, workflow_manifest });
+});
+
+app.get("/api/beleidskompas/documents/:docId/preview", requireAuth, (req, res) => {
+  const docId = String(req.params.docId || "").trim();
+  if (!docId) return res.status(400).json({ error: "docId ontbreekt" });
+
+  const state = readBeleidskompasState();
+  const doc = state.documents.find((d) => String(d.id || "") === docId);
+  if (!doc) return res.status(404).json({ error: "Document niet gevonden" });
+  return res.json({ ok: true, preview_text: String(doc.preview_text || "") });
+});
+
+app.get("/api/beleidskompas/documents/:docId/download", requireAuth, (req, res) => {
+  const docId = String(req.params.docId || "").trim();
+  if (!docId) return res.status(400).json({ error: "docId ontbreekt" });
+
+  const state = readBeleidskompasState();
+  const doc = state.documents.find((d) => String(d.id || "") === docId);
+  if (!doc) return res.status(404).json({ error: "Document niet gevonden" });
+
+  const b64 = String(doc.content_base64 || "").trim();
+  if (!b64) return res.status(404).json({ error: "Geen inhoud beschikbaar" });
+
+  const bytes = Buffer.from(b64, "base64");
+  res.setHeader("Content-Type", String(doc.mime_type || "application/octet-stream"));
+  res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(String(doc.filename || "document"))}"`);
+  return res.status(200).send(bytes);
+});
+
+app.delete("/api/beleidskompas/documents/:docId", requireAuth, (req, res) => {
+  const docId = String(req.params.docId || "").trim();
+  if (!docId) return res.status(400).json({ error: "docId ontbreekt" });
+
+  const state = readBeleidskompasState();
+  const before = state.documents.length;
+  state.documents = state.documents.filter((d) => String(d.id || "") !== docId);
+  if (state.documents.length === before) return res.status(404).json({ error: "Document niet gevonden" });
+  const saved = writeBeleidskompasState(state);
+  const workflow_manifest = syncBeleidskompasWorkflowFiles(saved);
+  return res.json({ ok: true, removed: docId, workflow_manifest });
+});
+
+app.post("/api/beleidskompas/rag/query", requireAuth, (req, res) => {
+  try {
+    const state = readBeleidskompasState();
+    const flow = normalizeBeleidskompasFlow(state.draft || state.live || defaultBeleidskompasFlow());
+    const stepId = String(req.body?.step_id || "").trim();
+    let step = Array.isArray(flow.steps) ? flow.steps.find((s) => String(s?.id || "") === stepId) : null;
+    if (!step) step = Array.isArray(flow.steps) ? flow.steps[0] : null;
+    if (!step) return res.status(400).json({ error: "Geen stappen geconfigureerd" });
+
+    const result = selectBeleidskompasRagDocs({
+      step,
+      question: String(req.body?.question || ""),
+      caseText: String(req.body?.case_text || ""),
+      stepFields: req.body?.step_fields && typeof req.body.step_fields === "object" ? req.body.step_fields : {},
+      documents: state.documents || [],
+    });
+
+    return res.json({
+      ok: true,
+      step_id: String(step.id || stepId),
+      rag: result.rag,
+      citations: result.docs.map((d, i) => ({
+        rank: i + 1,
+        id: d.id,
+        filename: d.filename,
+        score: Number(d.score.toFixed(4)),
+        tags: d.tags,
+        preview: d.preview,
+      })),
+      trace: {
+        algorithm: result.rag.algorithm,
+        top_k: result.rag.top_k,
+        min_score: result.rag.min_score,
+        tag_filter_mode: result.rag.tag_filter_mode,
+        required_tags: result.rag.required_tags,
+        matched_docs: result.docs.length,
+      },
+    });
+  } catch (err) {
+    return res.status(400).json({ error: String(err?.message || err) });
   }
 });
 

@@ -78,6 +78,7 @@
   .target-iframe { background: #fef3c7; color: #92400e; }
   .target-versimpelaar { background: #fce7f3; color: #9d174d; }
   .target-transcriptie { background: #ede9fe; color: #5b21b6; }
+  .target-beleidskompas { background: #e0f2fe; color: #075985; }
 </style>
 </head>
 <body>
@@ -103,6 +104,9 @@
     <a href="/dashboard">Dashboard</a>
     <a href="/help-editor">Handleiding</a>
     <a href="/apps-editor" class="active">Apps</a>
+    <a href="/crawler-editor">Crawler</a>
+    <a href="/orchestrator-editor">Orchestrator</a>
+    <a href="/beleidskompas-editor">Beleidskompas</a>
     <a href="/logout">Uitloggen</a>
   </div>
 </nav>
@@ -233,6 +237,7 @@ const TARGET_TYPES = [
   { value: "iframe", label: "Iframe viewer" },
   { value: "versimpelaar", label: "Versimpelaar" },
   { value: "transcriptie", label: "Live transcriptie" },
+  { value: "beleidskompas", label: "Beleidskompas" },
 ];
 
 const TARGET_BADGES = {
@@ -241,6 +246,7 @@ const TARGET_BADGES = {
   iframe: "target-iframe",
   versimpelaar: "target-versimpelaar",
   transcriptie: "target-transcriptie",
+  beleidskompas: "target-beleidskompas",
 };
 
 function render() {
@@ -309,7 +315,7 @@ function renderApps() {
       const overlapMs = Number(cfg.overlap_ms || 650);
       const contextPrompt = cfg.context_prompt || "Nederlands gesprek, maak een complete en nette transcriptie.";
       const maxDuration = Number(cfg.max_duration_minutes || 120);
-      const model = cfg.litellm_model || "whisper";
+      const model = cfg.litellm_model || "gpt-4o-transcribe";
       const language = cfg.language || "nl";
       const enableSpeakerLabels = cfg.enable_speaker_labels !== false;
       const includeTimestamps = cfg.include_timestamps !== false;
@@ -328,7 +334,7 @@ function renderApps() {
             <div class="form-group">
               <label>LiteLLM model</label>
               <input type="text" value="${escAttr(model)}" onchange="updateConfig(${ai}, 'litellm_model', this.value)">
-              <div class="help-text"><strong>Doel:</strong> model-alias in LiteLLM (bijv. <code>whisper</code>).<br><strong>Waarde:</strong> tekst/aliasnaam.<br><strong>Advies:</strong> gebruik alleen een alias die in LiteLLM bestaat.<br><strong>Nadeel fout alias:</strong> 4xx/5xx modelfout.</div>
+              <div class="help-text"><strong>Doel:</strong> model-alias in LiteLLM (bijv. <code>gpt-4o-transcribe</code>).<br><strong>Waarde:</strong> tekst/aliasnaam.<br><strong>Advies:</strong> gebruik alleen een alias die in LiteLLM bestaat.<br><strong>Nadeel fout alias:</strong> 4xx/5xx modelfout.</div>
             </div>
             <div class="form-group" style="flex:0 0 120px;">
               <label>Taal</label>
@@ -470,7 +476,7 @@ function updateTarget(ai, value) {
       overlap_ms: 650,
       context_prompt: "Nederlands gesprek, maak een complete en nette transcriptie.",
       max_duration_minutes: 120,
-      litellm_model: "whisper",
+      litellm_model: "gpt-4o-transcribe",
       language: "nl",
       enable_speaker_labels: false,
       include_timestamps: true,
